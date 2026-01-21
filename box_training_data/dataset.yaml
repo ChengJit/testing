@@ -1,0 +1,6 @@
+names:
+  0: box
+nc: 1
+path: /home/jetson/test/box_training_data
+train: train/images
+val: val/images

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Torch / AI models
+*.pt
+*.pth
+*.onnx
+*.engine
+*.whl
+
+# YOLO / TensorRT
+models/
+torchvision/
+
+# Data / outputs
+datasets/
+snapshots/
+known_faces/
+unknown_faces/
+*.csv
+*.pkl
+*.npz
+
+# Logs / backups
+*.log
+*.backup_*
+*.bak
+
+# OS
+.DS_Store

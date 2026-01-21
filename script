@@ -1,0 +1,10 @@
+python3 /home/jetson/test/train_box_detector.py --mode test --model box_detection_training/cardboard_box_detector/weights/best.pt
+python3 train_box_detector.py --mode train --model yolo11n.pt --batch 2 --imgsz 320
+python3 train_box_detector.py --mode collect
+python3 train_box_detector.py --mode collect --rtsp "rtsp://admin:Aa112233@192.168.100.111:554/Streaming/Channels/501"
+
+
+python3 train_box_detector.py --mode collect --rtsp "rtsp://admin:Aa112233@192.168.100.111:554/Streaming/Channels/501"
+python3 train_box_detector.py --mode train --model yolo11n.pt --data-dir box_training_data --batch 2 --imgsz 320
+python3 /home/jetson/test/train_box_detector.py --mode test --model box_detection_training/cardboard_box_detector/weights/best.pt --rtsp "rtsp://admin:Aa112233@192.168.100.111:554/Streaming/Channels/501"
+

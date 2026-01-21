@@ -1,0 +1,22 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting onnx
+  Using cached onnx-1.20.0-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl.metadata (8.4 kB)
+Collecting onnxslim
+  Downloading onnxslim-0.1.80-py3-none-any.whl.metadata (10 kB)
+Requirement already satisfied: numpy>=1.23.2 in /home/jetson/.local/lib/python3.10/site-packages (from onnx) (1.26.4)
+Collecting protobuf>=4.25.1 (from onnx)
+  Using cached protobuf-6.33.2-cp39-abi3-manylinux2014_aarch64.whl.metadata (593 bytes)
+Requirement already satisfied: typing_extensions>=4.7.1 in /home/jetson/.local/lib/python3.10/site-packages (from onnx) (4.15.0)
+Collecting ml_dtypes>=0.5.0 (from onnx)
+  Using cached ml_dtypes-0.5.4-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (8.9 kB)
+Requirement already satisfied: sympy>=1.13.1 in /home/jetson/.local/lib/python3.10/site-packages (from onnxslim) (1.14.0)
+Requirement already satisfied: packaging in /usr/lib/python3/dist-packages (from onnxslim) (21.3)
+Requirement already satisfied: colorama in /usr/lib/python3/dist-packages (from onnxslim) (0.4.4)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /home/jetson/.local/lib/python3.10/site-packages (from sympy>=1.13.1->onnxslim) (1.3.0)
+Using cached onnx-1.20.0-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl (17.9 MB)
+Downloading onnxslim-0.1.80-py3-none-any.whl (167 kB)
+Using cached ml_dtypes-0.5.4-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (5.1 MB)
+Using cached protobuf-6.33.2-cp39-abi3-manylinux2014_aarch64.whl (324 kB)
+Installing collected packages: protobuf, ml_dtypes, onnx, onnxslim
+
+Successfully installed ml_dtypes-0.5.4 onnx-1.20.0 onnxslim-0.1.80 protobuf-6.33.2
