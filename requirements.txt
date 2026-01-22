@@ -1,0 +1,20 @@
+# Requirements for Inventory Door Monitor
+# Cross-platform version
+
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# YOLO object detection
+ultralytics>=8.0.0
+
+# Face recognition
+insightface>=0.7.0
+onnxruntime>=1.14.0
+
+# PyTorch (CPU version - for GPU, install separately)
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Note: For GPU support, install PyTorch with CUDA:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118

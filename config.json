@@ -1,0 +1,37 @@
+{
+  "detection": {
+    "yolo_model": "yolo11n.pt",
+    "yolo_imgsz": 480,
+    "yolo_conf": 0.5,
+    "box_model": null,
+    "box_conf": 0.4,
+    "face_model": "buffalo_s",
+    "face_det_size": [320, 320],
+    "face_recognition_threshold": 0.45
+  },
+  "tracking": {
+    "track_thresh": 0.5,
+    "track_buffer": 30,
+    "entry_zone_end": 0.25,
+    "exit_zone_start": 0.75,
+    "direction_frames": 5
+  },
+  "jetson": {
+    "use_tensorrt": true,
+    "fp16_inference": true,
+    "process_fps": 15
+  },
+  "camera": {
+    "source": "rtsp://admin:admin@192.168.1.100:554/stream1",
+    "width": 1920,
+    "height": 1080
+  },
+  "zone": {
+    "roi_x1": 0.0,
+    "roi_y1": 0.0,
+    "roi_x2": 1.0,
+    "roi_y2": 1.0,
+    "door_line": 0.5,
+    "enter_direction_down": true
+  }
+}

@@ -1,0 +1,29 @@
+# Requirements for Inventory Door Monitor
+# Optimized for Jetson Orin Nano (JetPack 5.x / 6.x)
+
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# YOLO object detection
+ultralytics>=8.0.0
+
+# Face recognition
+insightface>=0.7.0
+onnxruntime-gpu>=1.14.0  # Use onnxruntime on non-GPU systems
+
+# Note: On Jetson, install PyTorch and TensorRT from NVIDIA:
+# https://developer.nvidia.com/embedded/downloads
+#
+# JetPack 5.x:
+#   pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v51/
+#
+# JetPack 6.x:
+#   pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60/
+
+# Optional: For GStreamer pipeline support (usually pre-installed on Jetson)
+# PyGObject>=3.40.0
+
+# Development/testing (optional)
+# pytest>=7.0.0
+# black>=22.0.0
