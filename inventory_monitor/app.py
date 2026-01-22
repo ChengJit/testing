@@ -24,12 +24,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class BoxInfo:
+    """Information about a detected box."""
+    bbox: Tuple[int, int, int, int]
+    confidence: float
+    class_name: str
+    method: str  # detection method used
+
+
+@dataclass
 class ProcessingResult:
     """Result from AI processing pipeline."""
     frame_id: int
     persons: List[Tuple[Tuple[int, int, int, int], float]]  # (bbox, conf)
     faces: Dict[int, Tuple[str, float]]  # track_id -> (name, confidence)
     boxes: Dict[int, int]  # track_id -> box_count
+    box_detections: Dict[int, List[BoxInfo]]  # track_id -> list of box info
+    all_boxes: List[BoxInfo]  # all detected boxes for visualization
     processing_time_ms: float
 
 
@@ -166,11 +177,34 @@ class AIWorker:
 
         # 3. Box detection for each person
         boxes = {}
-        person_bboxes = [track.bbox for track in tracks.values()]
+        box_detections = {}
+        all_boxes = []
 
         for track_id, track in tracks.items():
             carried_boxes = self.box_detector.detect_carried_boxes(frame, track.bbox)
             boxes[track_id] = len(carried_boxes)
+
+            # Store detailed box info
+            track_box_info = []
+            for box in carried_boxes:
+                box_info = BoxInfo(
+                    bbox=box.bbox,
+                    confidence=box.confidence,
+                    class_name=box.class_name,
+                    method=box.detection_method
+                )
+                track_box_info.append(box_info)
+                all_boxes.append(box_info)
+
+            box_detections[track_id] = track_box_info
+
+            # Log box detections
+            if carried_boxes:
+                identity = tracks[track_id].identity or f"Track_{track_id}"
+                logger.info(
+                    f"[BOX] {identity} carrying {len(carried_boxes)} box(es): "
+                    f"{[f'{b.class_name}({b.confidence:.0%})' for b in carried_boxes]}"
+                )
 
         processing_time = (time.time() - start_time) * 1000
 
@@ -179,6 +213,8 @@ class AIWorker:
             persons=persons,
             faces=faces,
             boxes=boxes,
+            box_detections=box_detections,
+            all_boxes=all_boxes,
             processing_time_ms=processing_time
         )
 
@@ -267,8 +303,11 @@ class InventoryMonitor:
         self.start_time = 0.0
 
         # Display settings
-        self.show_zones = True
-        self.show_stats = True
+        self.show_zones = config.display.show_zones
+        self.show_stats = config.display.show_stats
+        self.show_boxes = config.display.show_boxes
+        self.display_width = config.display.width
+        self.display_height = config.display.height
 
     def start(self):
         """Start the monitoring application."""
@@ -340,6 +379,14 @@ class InventoryMonitor:
                 # Draw and display
                 if not self.config.headless:
                     display_frame = self._draw_overlay(frame)
+
+                    # Resize to 1080p for display
+                    display_frame = cv2.resize(
+                        display_frame,
+                        (self.display_width, self.display_height),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+
                     cv2.imshow("Inventory Monitor", display_frame)
 
                     key = cv2.waitKey(1) & 0xFF
@@ -349,8 +396,15 @@ class InventoryMonitor:
                         self.show_zones = not self.show_zones
                     elif key == ord('s'):
                         self.show_stats = not self.show_stats
+                    elif key == ord('b'):
+                        self.show_boxes = not self.show_boxes
                     elif key == ord('r'):
                         self._handle_registration()
+                    elif key == ord('t'):
+                        # Retrain faces from images
+                        logger.info("Retraining faces from images...")
+                        count = self.face_recognizer.retrain_all()
+                        logger.info(f"Retrained {count} faces")
 
                 # Memory cleanup periodically
                 if self.frame_count % self.config.jetson.clear_cache_interval == 0:
@@ -436,6 +490,8 @@ class InventoryMonitor:
             # Door line
             cv2.line(display, (0, zone_info["door_line"]), (w, zone_info["door_line"]),
                      (0, 255, 255), 2)
+            cv2.putText(display, "DOOR LINE", (10, zone_info["door_line"] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             # Entry zone
             cv2.rectangle(display,
@@ -448,6 +504,27 @@ class InventoryMonitor:
                           (0, zone_info["exit_zone"][0]),
                           (w, zone_info["exit_zone"][1]),
                           (0, 0, 255), 1)
+
+        # Draw detected boxes
+        if self.show_boxes and self.last_ai_result:
+            for box_info in self.last_ai_result.all_boxes:
+                bx1, by1, bx2, by2 = box_info.bbox
+
+                # Cyan color for boxes
+                box_color = (255, 255, 0)  # Cyan
+
+                # Draw box bounding box
+                cv2.rectangle(display, (bx1, by1), (bx2, by2), box_color, 2)
+
+                # Draw box label
+                box_label = f"{box_info.class_name} {box_info.confidence:.0%}"
+                cv2.putText(display, box_label, (bx1, by1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+                # Draw detection method indicator
+                method_short = box_info.method[:3].upper()
+                cv2.putText(display, method_short, (bx2 - 30, by2 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1)
 
         # Draw tracked persons
         tracks = self.tracker.get_confirmed_tracks()
@@ -469,43 +546,60 @@ class InventoryMonitor:
             # Label
             name = track.identity or f"ID:{track_id}"
             conf_str = f"{track.identity_confidence:.0%}" if track.identity else ""
-            box_str = f"[{track.box_count}]" if track.box_count > 0 else ""
+            box_str = f" [{track.box_count} box]" if track.box_count > 0 else ""
 
-            label = f"{name} {conf_str} {box_str}".strip()
-            cv2.putText(display, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            label = f"{name} {conf_str}{box_str}".strip()
+
+            # Draw label background for readability
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(display, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+            cv2.putText(display, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
             # Direction arrow
             direction = track.get_direction()
             if direction:
                 cx, cy = track.center
                 arrow_color = (0, 255, 0) if direction == "entering" else (0, 0, 255)
-                dy = 30 if direction == "entering" else -30
-                cv2.arrowedLine(display, (cx, cy), (cx, cy + dy), arrow_color, 2)
+                dy = 40 if direction == "entering" else -40
+                cv2.arrowedLine(display, (cx, cy), (cx, cy + dy), arrow_color, 3)
 
-        # Draw stats
+                # Direction label
+                dir_label = "ENTERING" if direction == "entering" else "EXITING"
+                cv2.putText(display, dir_label, (cx - 40, cy + dy + (20 if dy > 0 else -10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, arrow_color, 2)
+
+        # Draw stats panel
         if self.show_stats:
             stats = self.event_manager.get_statistics()
             elapsed = time.time() - self.start_time
             fps = self.frame_count / elapsed if elapsed > 0 else 0
 
+            # Semi-transparent background for stats
+            overlay = display.copy()
+            cv2.rectangle(overlay, (5, 5), (250, 160), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
+
             stats_text = [
                 f"FPS: {fps:.1f}",
                 f"AI: {self.last_ai_result.processing_time_ms:.0f}ms" if self.last_ai_result else "AI: --",
-                f"In: {stats['total_entries']} | Out: {stats['total_exits']}",
-                f"Boxes: +{stats['boxes_brought_in']} / -{stats['boxes_taken_out']}",
-                f"Inside: {stats['persons_currently_inside']}",
+                f"Entries: {stats['total_entries']} | Exits: {stats['total_exits']}",
+                f"Boxes In: {stats['boxes_brought_in']}",
+                f"Boxes Out: {stats['boxes_taken_out']}",
+                f"People Inside: {stats['persons_currently_inside']}",
             ]
 
-            y = 30
+            y = 25
             for text in stats_text:
-                cv2.putText(display, text, (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                y += 25
+                cv2.putText(display, text, (15, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                y += 22
 
-        # Instructions
-        cv2.putText(display, "Q:Quit Z:Zones S:Stats R:Register",
-                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Instructions bar at bottom
+        instructions = "Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain"
+        cv2.rectangle(display, (0, h - 25), (w, h), (50, 50, 50), -1)
+        cv2.putText(display, instructions, (10, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         return display
 

@@ -71,12 +71,22 @@ class JetsonConfig:
 @dataclass
 class CameraConfig:
     """Camera/video source configuration."""
-    source: str = "rtsp://admin:admin@192.168.1.100:554/stream1"
+    source: str = "rtsp://fasspay:fasspay2025@192.168.122.127:554/stream1"
     width: int = 1920
     height: int = 1080
     fps: int = 30
     buffer_size: int = 1  # Minimize latency
     reconnect_delay: float = 5.0  # Seconds before reconnect attempt
+
+
+@dataclass
+class DisplayConfig:
+    """Display configuration."""
+    width: int = 1920
+    height: int = 1080
+    show_zones: bool = True
+    show_stats: bool = True
+    show_boxes: bool = True
 
 
 @dataclass
@@ -103,6 +113,7 @@ class Config:
     jetson: JetsonConfig = field(default_factory=JetsonConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     zone: ZoneConfig = field(default_factory=ZoneConfig)
+    display: DisplayConfig = field(default_factory=DisplayConfig)
 
     # Paths
     data_dir: Path = field(default_factory=lambda: Path("data"))

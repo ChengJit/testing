@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inventory_monitor.app import main, InventoryMonitor
 from inventory_monitor.config import Config
 from inventory_monitor.utils import get_gpu_info
+from inventory_monitor.detectors import FaceRecognizer
 
 
 def setup_wizard():
@@ -89,6 +90,42 @@ def setup_wizard():
     print("=" * 50 + "\n")
 
 
+def train_faces():
+    """Train face recognition from images in known_faces directory."""
+    print("\n" + "=" * 50)
+    print("  Face Training from Images")
+    print("=" * 50 + "\n")
+
+    config = Config.load("config.json")
+
+    print(f"Looking for face images in: {config.faces_dir}")
+    print()
+
+    # Initialize face recognizer
+    recognizer = FaceRecognizer(
+        model_name=config.detection.face_model,
+        det_size=config.detection.face_det_size,
+        faces_dir=str(config.faces_dir),
+    )
+
+    # Train from images
+    print("Training faces from images...")
+    count = recognizer.train_from_images()
+
+    if count > 0:
+        print(f"\nSuccessfully trained {count} people!")
+        print(f"Embeddings saved to: known_embeddings.npz")
+    else:
+        print("\nNo faces were trained.")
+        print("Make sure you have folders like:")
+        print("  known_faces/")
+        print("    person_name/")
+        print("      image1.jpg")
+        print("      image2.jpg")
+
+    print()
+
+
 def show_status():
     """Show system status and configuration."""
     print("\n" + "=" * 50)
@@ -142,6 +179,8 @@ if __name__ == "__main__":
                         help="Run interactive setup wizard")
     parser.add_argument("--status", action="store_true",
                         help="Show system status and exit")
+    parser.add_argument("--train", action="store_true",
+                        help="Train face recognition from known_faces images")
 
     args = parser.parse_args()
 
@@ -149,6 +188,8 @@ if __name__ == "__main__":
         setup_wizard()
     elif args.status:
         show_status()
+    elif args.train:
+        train_faces()
     else:
         # Run the main application
         main()

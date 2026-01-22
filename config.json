@@ -22,9 +22,16 @@
     "process_fps": 15
   },
   "camera": {
-    "source": "rtsp://admin:admin@192.168.1.100:554/stream1",
+    "source": "rtsp://fasspay:fasspay2025@192.168.122.127:554/stream1",
     "width": 1920,
     "height": 1080
+  },
+  "display": {
+    "width": 1920,
+    "height": 1080,
+    "show_zones": true,
+    "show_stats": true,
+    "show_boxes": true
   },
   "zone": {
     "roi_x1": 0.0,

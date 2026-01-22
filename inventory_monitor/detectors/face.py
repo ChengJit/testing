@@ -114,7 +114,112 @@ class FaceRecognizer:
                 self.known_names = []
                 self.known_embeddings = None
         else:
-            logger.info("No existing embeddings found, starting fresh")
+            logger.info("No existing embeddings found, will train from images")
+            # Auto-train from existing face images
+            self.train_from_images()
+
+    def train_from_images(self) -> int:
+        """
+        Train face recognition from existing images in known_faces directory.
+
+        Directory structure:
+            known_faces/
+                person1/
+                    img1.jpg
+                    img2.jpg
+                person2/
+                    img1.jpg
+                    ...
+
+        Returns:
+            Number of people trained
+        """
+        if self.app is None:
+            logger.warning("Face model not loaded, cannot train")
+            return 0
+
+        if not self.faces_dir.exists():
+            logger.info(f"Faces directory not found: {self.faces_dir}")
+            return 0
+
+        trained_count = 0
+        new_names = []
+        new_embeddings = []
+
+        # Iterate through person folders
+        for person_dir in self.faces_dir.iterdir():
+            if not person_dir.is_dir():
+                continue
+
+            person_name = person_dir.name
+            person_embeddings = []
+
+            logger.info(f"Training face for: {person_name}")
+
+            # Process each image in the folder
+            image_files = list(person_dir.glob("*.jpg")) + \
+                          list(person_dir.glob("*.jpeg")) + \
+                          list(person_dir.glob("*.png"))
+
+            for img_path in image_files:
+                try:
+                    # Read image
+                    img = cv2.imread(str(img_path))
+                    if img is None:
+                        continue
+
+                    # Detect faces
+                    faces = self.app.get(img)
+
+                    if faces:
+                        # Use largest face
+                        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+                        if face.normed_embedding is not None:
+                            person_embeddings.append(face.normed_embedding)
+                            logger.debug(f"  Extracted embedding from {img_path.name}")
+
+                except Exception as e:
+                    logger.warning(f"  Failed to process {img_path}: {e}")
+
+            # Average embeddings for this person
+            if person_embeddings:
+                avg_embedding = np.mean(person_embeddings, axis=0)
+                avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
+
+                new_names.append(person_name)
+                new_embeddings.append(avg_embedding)
+                trained_count += 1
+
+                logger.info(f"  Trained {person_name} with {len(person_embeddings)} images")
+
+        # Update known faces
+        if new_embeddings:
+            if self.known_embeddings is None:
+                self.known_embeddings = np.array(new_embeddings)
+                self.known_names = new_names
+            else:
+                # Merge with existing (avoid duplicates)
+                for name, emb in zip(new_names, new_embeddings):
+                    if name not in self.known_names:
+                        self.known_names.append(name)
+                        self.known_embeddings = np.vstack([self.known_embeddings, emb.reshape(1, -1)])
+                    else:
+                        # Update existing
+                        idx = self.known_names.index(name)
+                        self.known_embeddings[idx] = emb
+
+            # Save updated embeddings
+            self.save_embeddings()
+            logger.info(f"Training complete: {trained_count} people trained")
+
+        return trained_count
+
+    def retrain_all(self) -> int:
+        """Force retrain all faces from images, replacing existing embeddings."""
+        self.known_names = []
+        self.known_embeddings = None
+        return self.train_from_images()
 
     def save_embeddings(self):
         """Save known face embeddings to file."""
