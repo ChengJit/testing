@@ -6,6 +6,7 @@ Focused on: live feed, entry/exit detection with boxes, face verification, and l
 import logging
 import time
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Set
 
@@ -25,6 +26,7 @@ except ImportError:
 
 from .config import Config
 from .app import InventoryMonitor, ProcessingResult
+from .core import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,18 @@ def _bgr_to_photo(bgr: np.ndarray, size: tuple = None) -> ImageTk.PhotoImage:
         bgr = cv2.resize(bgr, size, interpolation=cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return ImageTk.PhotoImage(image=Image.fromarray(rgb))
+
+
+@dataclass
+class PendingVerification:
+    """An exit-with-boxes event waiting for user identification."""
+    track_id: int
+    identity: Optional[str]
+    identity_confidence: float
+    box_count: int
+    entry_box_count: int
+    crop: Optional[np.ndarray]  # person crop at time of exit
+    timestamp: float
 
 
 class InventoryGUI:
@@ -58,6 +72,13 @@ class InventoryGUI:
         self._verified_tracks: Dict[int, float] = {}
         # Track IDs the user has explicitly confirmed (don't ask again)
         self._confirmed_tracks: Set[int] = set()
+
+        # Queue of exit-with-boxes events needing user identification
+        self._pending_exit_verifications: List[PendingVerification] = []
+        self._exit_verify_lock = threading.Lock()
+
+        # Keep last frame for cropping when exit event fires
+        self._last_frame: Optional[np.ndarray] = None
 
         # Build UI
         self.root = tk.Tk()
@@ -89,7 +110,8 @@ class InventoryGUI:
         self._build_sidebar(sidebar)
         top.add(sidebar, weight=1)
 
-        # Bottom: status bar
+        # Bottom: event log + status bar
+        self._build_event_log(main)
         self._build_status_bar(main)
 
     def _build_sidebar(self, parent: ttk.Frame):
@@ -142,6 +164,27 @@ class InventoryGUI:
                    command=self._refresh_faces_list).grid(row=row, column=0, **pad)
         row += 1
 
+    def _build_event_log(self, parent: ttk.Frame):
+        """Recent events log at the bottom."""
+        log_frame = ttk.LabelFrame(parent, text="Recent Events", height=120)
+        log_frame.pack(fill=tk.X, padx=4, pady=(0, 2))
+        log_frame.pack_propagate(False)
+
+        self.event_text = tk.Text(log_frame, height=5, font=("Consolas", 9),
+                                  state=tk.DISABLED, bg="#1e1e1e", fg="#cccccc")
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
+                                  command=self.event_text.yview)
+        self.event_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.event_text.pack(fill=tk.BOTH, expand=True)
+
+    def _append_event_log(self, text: str):
+        """Append a line to the event log widget."""
+        self.event_text.config(state=tk.NORMAL)
+        self.event_text.insert(tk.END, text + "\n")
+        self.event_text.see(tk.END)
+        self.event_text.config(state=tk.DISABLED)
+
     def _build_status_bar(self, parent: ttk.Frame):
         bar = ttk.Frame(parent)
         bar.pack(fill=tk.X, padx=4, pady=(0, 4))
@@ -158,6 +201,63 @@ class InventoryGUI:
         self.lbl_entries = ttk.Label(bar, text="In: 0 | Out: 0")
         self.lbl_entries.pack(side=tk.LEFT, padx=(0, 12))
 
+    # ================================================================ event callback
+
+    def _on_inventory_event(self, event):
+        """Called by EventManager for every entry/exit event (from AI thread)."""
+        # Build log line
+        identity = event.identity or "Unknown"
+        ts = event.timestamp.split("T")[1].split(".")[0] if "T" in event.timestamp else event.timestamp
+
+        if event.event_type == EventType.PERSON_ENTERED:
+            line = f"[{ts}] ENTERED: {identity} with {event.box_count} box(es)"
+        elif event.event_type == EventType.PERSON_EXITED:
+            entry_boxes = event.details.get("entry_box_count", 0)
+            line = (f"[{ts}] EXITED: {identity} with {event.box_count} box(es) "
+                    f"(entered with {entry_boxes})")
+            diff = event.details.get("box_difference", 0)
+            if diff > 0:
+                line += f" ** ALERT: taking {diff} extra box(es)!"
+        else:
+            line = f"[{ts}] {event.event_type.value}: {identity}"
+
+        # Schedule UI update on main thread
+        self.root.after(0, self._append_event_log, line)
+
+        # If person exited with boxes and is unknown/low-confidence, queue for verification
+        if event.event_type == EventType.PERSON_EXITED and event.box_count > 0:
+            is_unknown = (not event.identity or event.identity == "Unknown"
+                          or event.identity_confidence < self.VERIFY_THRESHOLD)
+            if is_unknown:
+                # Grab crop from last frame
+                crop = self._get_track_crop(event.track_id)
+                pv = PendingVerification(
+                    track_id=event.track_id,
+                    identity=event.identity,
+                    identity_confidence=event.identity_confidence,
+                    box_count=event.box_count,
+                    entry_box_count=event.details.get("entry_box_count", 0),
+                    crop=crop,
+                    timestamp=time.time(),
+                )
+                with self._exit_verify_lock:
+                    self._pending_exit_verifications.append(pv)
+
+    def _get_track_crop(self, track_id: int) -> Optional[np.ndarray]:
+        """Try to crop the person from the last frame."""
+        if self._last_frame is None or self.monitor is None:
+            return None
+        tracks = self.monitor.tracker.get_confirmed_tracks()
+        track = tracks.get(track_id)
+        if track is None:
+            return None
+        x1, y1, x2, y2 = track.bbox
+        h, w = self._last_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        crop = self._last_frame[y1:y2, x1:x2].copy()
+        return crop if crop.size > 0 else None
+
     # ================================================================ frame loop
 
     def _update_frame(self):
@@ -172,10 +272,17 @@ class InventoryGUI:
             return
 
         if frame is not None:
-            # Check for faces needing verification
-            if self.monitor.last_ai_result and not self._verify_dialog_open:
-                self._check_face_verification(
-                    self.monitor.last_ai_result, frame)
+            self._last_frame = frame
+
+            if not self._verify_dialog_open:
+                # Priority 1: exit-with-boxes verification
+                pending = self._pop_pending_exit()
+                if pending:
+                    self._open_exit_verify_dialog(pending)
+                # Priority 2: low-confidence face verification
+                elif self.monitor.last_ai_result:
+                    self._check_face_verification(
+                        self.monitor.last_ai_result, frame)
 
             # Draw + show
             try:
@@ -187,6 +294,13 @@ class InventoryGUI:
             self._update_status()
 
         self.root.after(33, self._update_frame)
+
+    def _pop_pending_exit(self) -> Optional[PendingVerification]:
+        """Pop the next pending exit verification if any."""
+        with self._exit_verify_lock:
+            if self._pending_exit_verifications:
+                return self._pending_exit_verifications.pop(0)
+        return None
 
     def _show_frame(self, frame: np.ndarray):
         cw = self.canvas.winfo_width()
@@ -216,7 +330,106 @@ class InventoryGUI:
         self.lbl_entries.config(
             text=f"In: {stats['total_entries']} | Out: {stats['total_exits']}")
 
-    # ================================================================ face verification
+    # ================================================================ exit-with-boxes verification
+
+    def _open_exit_verify_dialog(self, pv: PendingVerification):
+        """Mandatory dialog when someone exits with boxes and is unidentified."""
+        self._verify_dialog_open = True
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("ALERT: Unknown person exited with boxes!")
+        dialog.geometry("400x440")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg="#fff3cd")
+
+        # Cannot close without answering
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        # Alert header
+        header = tk.Label(dialog, text="ALERT: Person exited with boxes",
+                          font=("", 12, "bold"), fg="#856404", bg="#fff3cd")
+        header.pack(pady=(10, 5))
+
+        # Person crop
+        if pv.crop is not None and pv.crop.size > 0:
+            photo = _bgr_to_photo(pv.crop, (140, 180))
+            self._verify_photo = photo
+            ttk.Label(dialog, image=photo).pack(pady=5)
+        else:
+            ttk.Label(dialog, text="[No image captured]",
+                      font=("", 9)).pack(pady=5)
+
+        # Details
+        identity_text = pv.identity if pv.identity and pv.identity != "Unknown" else "Unknown"
+        info = (f"Identity: {identity_text} ({pv.identity_confidence:.0%} confidence)\n"
+                f"Exited with {pv.box_count} box(es) | Entered with {pv.entry_box_count}")
+        ttk.Label(dialog, text=info, font=("", 9), justify=tk.CENTER).pack(pady=4)
+
+        # Name input
+        ttk.Label(dialog, text="Who is this person?").pack(pady=(8, 2))
+        name_var = tk.StringVar(
+            value=pv.identity if pv.identity and pv.identity != "Unknown" else "")
+        entry = ttk.Entry(dialog, textvariable=name_var, width=25, font=("", 11))
+        entry.pack(pady=4)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        def _confirm():
+            name = name_var.get().strip()
+            if not name:
+                return  # must provide a name
+            # Save crop & train
+            if pv.crop is not None and pv.crop.size > 0:
+                self._save_and_train(pv.track_id, name, pv.crop)
+            # Log the identification correction
+            self._log_exit_identification(pv, name)
+            self._confirmed_tracks.add(pv.track_id)
+            self._verify_dialog_open = False
+            dialog.destroy()
+
+        def _skip_unknown():
+            # Log as unknown but still record it
+            self._log_exit_identification(pv, "Unknown")
+            self._verify_dialog_open = False
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="Confirm", command=_confirm, width=12).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Leave Unknown", command=_skip_unknown,
+                   width=14).pack(side=tk.LEFT, padx=4)
+
+        entry.bind("<Return>", lambda e: _confirm())
+
+    def _log_exit_identification(self, pv: PendingVerification, name: str):
+        """Log the user's identification of the exiting person."""
+        ts = time.strftime("%H:%M:%S")
+        self._append_event_log(
+            f"[{ts}] IDENTIFIED EXIT: Track {pv.track_id} -> {name} "
+            f"({pv.box_count} box(es))")
+
+        # Record a follow-up event in the event manager
+        if self.monitor:
+            self.monitor.event_manager.record_event(
+                event_type=EventType.IDENTITY_RECOGNIZED,
+                track_id=pv.track_id,
+                identity=name,
+                identity_confidence=1.0 if name != "Unknown" else 0.0,
+                box_count=pv.box_count,
+                direction="exiting",
+                details={
+                    "source": "manual_verification",
+                    "original_identity": pv.identity,
+                    "original_confidence": pv.identity_confidence,
+                    "entry_box_count": pv.entry_box_count,
+                },
+            )
+
+    # ================================================================ face verification (low confidence)
 
     def _check_face_verification(self, result: ProcessingResult,
                                  frame: np.ndarray):
@@ -255,7 +468,6 @@ class InventoryGUI:
                 if crop.size == 0:
                     continue
 
-                # Also check if face recognizer has unknown face data
                 box_count = result.boxes.get(track_id, 0)
                 self._open_verify_dialog(
                     track_id, name, conf, crop, box_count)
@@ -274,12 +486,12 @@ class InventoryGUI:
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        # Prevent closing without answering
-        dialog.protocol("WM_DELETE_WINDOW", lambda: self._dismiss_verify(dialog, track_id))
+        dialog.protocol("WM_DELETE_WINDOW",
+                        lambda: self._dismiss_verify(dialog, track_id))
 
         # Person crop
         photo = _bgr_to_photo(crop, (160, 200))
-        self._verify_photo = photo  # prevent GC
+        self._verify_photo = photo
         ttk.Label(dialog, image=photo).pack(pady=(10, 5))
 
         # Info
@@ -294,7 +506,8 @@ class InventoryGUI:
 
         # Name input
         ttk.Label(dialog, text="Enter name (or correct):").pack(pady=(8, 2))
-        name_var = tk.StringVar(value=suggested_name if suggested_name != "Unknown" else "")
+        name_var = tk.StringVar(
+            value=suggested_name if suggested_name != "Unknown" else "")
         entry = ttk.Entry(dialog, textvariable=name_var, width=25, font=("", 11))
         entry.pack(pady=4)
         entry.focus_set()
@@ -320,17 +533,16 @@ class InventoryGUI:
         ttk.Button(btn_frame, text="Skip", command=_skip, width=12).pack(
             side=tk.LEFT, padx=4)
 
-        # Enter key confirms
         entry.bind("<Return>", lambda e: _confirm())
 
     def _dismiss_verify(self, dialog, track_id):
-        """Handle dialog close (X button)."""
         self._verify_dialog_open = False
         dialog.destroy()
 
+    # ================================================================ save & train
+
     def _save_and_train(self, track_id: int, name: str, crop: np.ndarray):
         """Save face crop to known_faces/<name>/ and retrain embeddings."""
-        # Save the crop image
         person_dir = self.config.faces_dir / name
         person_dir.mkdir(parents=True, exist_ok=True)
         img_path = person_dir / f"{name}_{int(time.time())}_{track_id}.jpg"
@@ -344,7 +556,6 @@ class InventoryGUI:
                 extra_path = person_dir / f"{name}_{int(time.time())}_{track_id}_f{i}.jpg"
                 cv2.imwrite(str(extra_path), img)
             logger.info(f"Saved {len(unknown_data.images)} additional face crops for {name}")
-            # Clear collected data
             del self.monitor.face_recognizer.unknown_faces[track_id]
 
         # Update track identity immediately
@@ -357,7 +568,6 @@ class InventoryGUI:
         self._retrain_background()
 
     def _retrain_background(self):
-        """Retrain face embeddings in a background thread."""
         if self._training_in_progress:
             return
 
@@ -392,7 +602,6 @@ class InventoryGUI:
             self.monitor.show_boxes = self.var_boxes.get()
 
     def _refresh_faces_list(self):
-        """Refresh the known faces listbox."""
         self.faces_listbox.delete(0, tk.END)
         if self.config.faces_dir.exists():
             for person_dir in sorted(self.config.faces_dir.iterdir()):
@@ -412,6 +621,9 @@ class InventoryGUI:
             logger.error("Failed to start monitor")
             self.root.destroy()
             return
+
+        # Register event callback to catch entry/exit events
+        self.monitor.event_manager.register_callback(self._on_inventory_event)
 
         self._refresh_faces_list()
         self.root.after(100, self._update_frame)
