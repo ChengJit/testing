@@ -6,7 +6,10 @@
       "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\kafka-web\")",
       "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\*kafka-web*\")",
       "Bash(wc:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing2\"\" | findstr /E \"inventory)",
+      "Bash(run_monitor \")",
+      "Bash(dir /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing2\")"
     ]
   }
 }

@@ -373,6 +373,39 @@ class InventoryMonitor:
 
         logger.info("Inventory Monitor stopped")
 
+    def process_one_frame(self) -> Optional[np.ndarray]:
+        """Process one frame through the pipeline. Returns raw frame or None."""
+        ret, frame = self.video.read(timeout=0.01)
+        if not ret or frame is None:
+            return None
+
+        self.frame_count += 1
+
+        # Initialize zone/state managers on first frame
+        if self.zone_manager is None:
+            h, w = frame.shape[:2]
+            self._init_managers(h, w)
+
+        # Submit to AI worker
+        tracks = self.tracker.get_confirmed_tracks()
+        self.ai_worker.submit(frame, tracks)
+
+        # Get AI result
+        result = self.ai_worker.get_result(timeout=0.001)
+        if result:
+            self.last_ai_result = result
+            self._process_ai_result(result)
+
+        # Update tracker with latest detections
+        if self.last_ai_result:
+            self.tracker.update(self.last_ai_result.persons)
+
+        # Memory cleanup periodically
+        if self.frame_count % self.config.jetson.clear_cache_interval == 0:
+            self.optimizer.clear_gpu_memory()
+
+        return frame
+
     def run(self):
         """Main application loop."""
         if not self.start():

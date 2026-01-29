@@ -181,6 +181,8 @@ if __name__ == "__main__":
                         help="Show system status and exit")
     parser.add_argument("--train", action="store_true",
                         help="Train face recognition from known_faces images")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch with Tkinter GUI")
 
     args = parser.parse_args()
 
@@ -190,6 +192,13 @@ if __name__ == "__main__":
         show_status()
     elif args.train:
         train_faces()
+    elif args.gui:
+        from inventory_monitor.gui import InventoryGUI
+        config = Config.load(args.config)
+        if args.source:
+            config.camera.source = args.source
+        gui = InventoryGUI(config)
+        gui.run()
     else:
         # Run the main application
         main()

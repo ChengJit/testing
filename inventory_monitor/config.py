@@ -117,6 +117,13 @@ class TrainingConfig:
 
 
 @dataclass
+class ReviewConfig:
+    """Review queue configuration for low-confidence detections."""
+    threshold: float = 0.6      # face confidence below this -> review queue
+    max_queue_size: int = 50
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     detection: DetectionConfig = field(default_factory=DetectionConfig)
@@ -126,6 +133,7 @@ class Config:
     zone: ZoneConfig = field(default_factory=ZoneConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
 
     # Paths
     data_dir: Path = field(default_factory=lambda: Path("data"))
@@ -183,6 +191,11 @@ class Config:
                     if hasattr(config.training, k):
                         setattr(config.training, k, v)
 
+            if "review" in data:
+                for k, v in data["review"].items():
+                    if hasattr(config.review, k):
+                        setattr(config.review, k, v)
+
         return config
 
     def save(self, path: str = "config.json"):
@@ -222,6 +235,10 @@ class Config:
                 "roi_y2": self.zone.roi_y2,
                 "door_line": self.zone.door_line,
                 "enter_direction_down": self.zone.enter_direction_down,
+            },
+            "review": {
+                "threshold": self.review.threshold,
+                "max_queue_size": self.review.max_queue_size,
             }
         }
 
