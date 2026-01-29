@@ -179,8 +179,8 @@ if __name__ == "__main__":
                         help="Path to config file")
     parser.add_argument("--source", "-s",
                         help="Video source (RTSP URL or device ID)")
-    parser.add_argument("--gui", action="store_true", default=True,
-                        help="Run with GUI display (default)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch with Tkinter GUI")
     parser.add_argument("--headless", action="store_true",
                         help="Run without display window")
     parser.add_argument("--debug", action="store_true",
@@ -200,6 +200,13 @@ if __name__ == "__main__":
         show_status()
     elif args.train:
         train_faces()
+    elif args.gui:
+        from inventory_monitor.gui import InventoryGUI
+        config = Config.load(args.config)
+        if args.source:
+            config.camera.source = args.source
+        gui = InventoryGUI(config)
+        gui.run()
     else:
         # Setup logging
         log_level = logging.DEBUG if args.debug else logging.INFO
