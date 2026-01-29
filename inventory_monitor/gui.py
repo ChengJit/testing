@@ -150,6 +150,30 @@ class InventoryGUI:
             row=row, column=0, sticky="ew", pady=8, padx=6)
         row += 1
 
+        # AI scale slider
+        ttk.Label(parent, text="AI Resolution", font=("", 10, "bold")).grid(
+            row=row, column=0, sticky="w", padx=6)
+        row += 1
+
+        self.var_ai_scale = tk.DoubleVar(value=self.config.jetson.ai_scale)
+        scale_frame = ttk.Frame(parent)
+        scale_frame.grid(row=row, column=0, sticky="ew", padx=6, pady=2)
+        scale_frame.columnconfigure(0, weight=1)
+
+        self.lbl_scale = ttk.Label(scale_frame,
+                                    text=f"{self.config.jetson.ai_scale:.0%}")
+        self.lbl_scale.pack(side=tk.RIGHT, padx=4)
+
+        self.scale_slider = ttk.Scale(
+            scale_frame, from_=0.25, to=1.0, orient=tk.HORIZONTAL,
+            variable=self.var_ai_scale, command=self._on_scale_change)
+        self.scale_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        row += 1
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=row, column=0, sticky="ew", pady=8, padx=6)
+        row += 1
+
         # Known faces list
         ttk.Label(parent, text="Known Faces", font=("", 10, "bold")).grid(
             row=row, column=0, sticky="w", padx=6)
@@ -594,6 +618,13 @@ class InventoryGUI:
 
     def _train_faces(self):
         self._retrain_background()
+
+    def _on_scale_change(self, value):
+        """Update AI processing scale live."""
+        val = float(value)
+        self.lbl_scale.config(text=f"{val:.0%}")
+        if self.monitor:
+            self.monitor.ai_worker.ai_scale = max(0.1, min(1.0, val))
 
     def _update_overlays(self):
         if self.monitor:

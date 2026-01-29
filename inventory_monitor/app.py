@@ -59,12 +59,14 @@ class AIWorker:
         box_detector: BoxDetector,
         process_fps: int = 15,
         training_collector: Optional[TrainingDataCollector] = None,
+        ai_scale: float = 1.0,
     ):
         self.person_detector = person_detector
         self.face_recognizer = face_recognizer
         self.box_detector = box_detector
         self.process_interval = 1.0 / process_fps
         self.training_collector = training_collector
+        self.ai_scale = max(0.1, min(1.0, ai_scale))
 
         self._input_queue: Queue = Queue(maxsize=2)
         self._output_queue: Queue = Queue(maxsize=2)
@@ -154,12 +156,53 @@ class AIWorker:
         tracks: Dict[int, TrackedObject],
         frame_id: int
     ) -> ProcessingResult:
-        """Process single frame through AI pipeline."""
+        """Process single frame through AI pipeline.
+
+        If ai_scale < 1.0, the frame is downscaled before AI processing and
+        all resulting bounding boxes are scaled back to original resolution.
+        """
         start_time = time.time()
 
-        # 1. Detect persons
-        person_detections = self.person_detector.detect(frame)
-        persons = [(d.bbox, d.confidence) for d in person_detections]
+        # --- Downscale for AI if configured ---
+        scale = self.ai_scale
+        need_scale = scale < 1.0
+        if need_scale:
+            oh, ow = frame.shape[:2]
+            nh, nw = int(oh * scale), int(ow * scale)
+            small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            inv = 1.0 / scale  # multiplier to map back
+
+            # Scale existing track bboxes into small-frame coords
+            small_tracks = {}
+            for tid, track in tracks.items():
+                # Create a lightweight copy-like object with scaled bbox
+                small_tracks[tid] = track
+                # We'll use scaled bbox only for per-track operations below
+        else:
+            small = frame
+            inv = 1.0
+            small_tracks = tracks
+
+        def _scale_bbox(bbox):
+            """Scale bbox from small frame back to original resolution."""
+            if not need_scale:
+                return bbox
+            x1, y1, x2, y2 = bbox
+            return (int(x1 * inv), int(y1 * inv),
+                    int(x2 * inv), int(y2 * inv))
+
+        def _down_bbox(bbox):
+            """Scale bbox from original resolution to small frame."""
+            if not need_scale:
+                return bbox
+            x1, y1, x2, y2 = bbox
+            return (int(x1 * scale), int(y1 * scale),
+                    int(x2 * scale), int(y2 * scale))
+
+        # 1. Detect persons (on small frame)
+        person_detections = self.person_detector.detect(small)
+        # Scale bboxes back to original resolution
+        persons = [(_scale_bbox(d.bbox), d.confidence) for d in person_detections]
 
         # 2. Face recognition for each tracked person
         faces = {}
@@ -168,22 +211,25 @@ class AIWorker:
                 faces[track_id] = (track.identity, track.identity_confidence)
                 continue
 
+            # Use small frame + scaled-down bbox for face recognition
             face_match = self.face_recognizer.recognize(
-                frame,
-                person_bbox=track.bbox,
+                small,
+                person_bbox=_down_bbox(track.bbox),
                 track_id=track_id
             )
 
             if face_match and face_match.name != "Unknown":
                 faces[track_id] = (face_match.name, face_match.confidence)
 
-        # 3. Box detection - run ONCE for the whole frame
-        person_bboxes_list = [track.bbox for track in tracks.values()]
-        all_box_detections = self.box_detector.detect(frame, person_bboxes_list or None)
+        # 3. Box detection on small frame
+        small_person_bboxes = [_down_bbox(t.bbox) for t in tracks.values()]
+        all_box_detections = self.box_detector.detect(
+            small, small_person_bboxes or None)
 
-        # 4. Assign boxes to persons by spatial overlap
-        person_bboxes_map = {tid: track.bbox for tid, track in tracks.items()}
-        assigned = self.box_detector.assign_boxes_to_persons(all_box_detections, person_bboxes_map)
+        # 4. Assign boxes to persons (in small-frame coords)
+        small_person_map = {tid: _down_bbox(t.bbox) for tid, t in tracks.items()}
+        assigned = self.box_detector.assign_boxes_to_persons(
+            all_box_detections, small_person_map)
 
         boxes = {}
         box_detections = {}
@@ -196,7 +242,7 @@ class AIWorker:
             track_box_info = []
             for box in carried:
                 box_info = BoxInfo(
-                    bbox=box.bbox,
+                    bbox=_scale_bbox(box.bbox),
                     confidence=box.confidence,
                     class_name=box.class_name,
                     method=box.detection_method
@@ -206,7 +252,7 @@ class AIWorker:
 
             box_detections[track_id] = track_box_info
 
-            # Enqueue to training data collector
+            # Enqueue to training data collector (use original frame)
             if self.training_collector:
                 self.training_collector.enqueue(
                     frame=frame,
@@ -263,6 +309,8 @@ class InventoryMonitor:
             height=config.camera.height,
             fps=config.camera.fps,
             buffer_size=config.camera.buffer_size,
+            capture_width=config.camera.capture_width,
+            capture_height=config.camera.capture_height,
         )
 
         # Initialize detectors
@@ -323,6 +371,7 @@ class InventoryMonitor:
             box_detector=self.box_detector,
             process_fps=optimal["process_fps"],
             training_collector=self.training_collector,
+            ai_scale=config.jetson.ai_scale,
         )
 
         # Stats

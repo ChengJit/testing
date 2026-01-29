@@ -1,8 +1,10 @@
 """
 Face recognition using InsightFace optimized for Jetson.
 Supports automatic identity registration and locking.
+Uses per-image embedding cache to avoid reprocessing known images.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -42,7 +44,7 @@ class FaceRecognizer:
     - Efficient buffalo_s model for Jetson
     - Automatic unknown face collection
     - Identity locking after high-confidence match
-    - Embedding persistence
+    - Embedding persistence with per-image cache for fast retraining
     """
 
     def __init__(
@@ -65,15 +67,22 @@ class FaceRecognizer:
         self.samples_for_registration = samples_for_registration
         self.sample_interval = sample_interval
 
+        # Per-image embedding cache path (sits next to the main embeddings file)
+        self._cache_path = self.embeddings_path.with_name("embedding_cache.json")
+
         # Known faces storage
         self.known_names: List[str] = []
         self.known_embeddings: Optional[np.ndarray] = None
+
+        # Per-image cache: { "person/filename.jpg": [512 floats] }
+        self._image_cache: Dict[str, List[float]] = {}
 
         # Unknown face collection
         self.unknown_faces: Dict[int, UnknownFaceData] = defaultdict(UnknownFaceData)
 
         # Initialize model
         self._load_model(model_name, use_gpu)
+        self._load_cache()
         self._load_embeddings()
 
         # Ensure faces directory exists
@@ -101,6 +110,32 @@ class FaceRecognizer:
             logger.error(f"Failed to initialize face recognition: {e}")
             self.app = None
 
+    def _load_cache(self):
+        """Load per-image embedding cache."""
+        if self._cache_path.exists():
+            try:
+                with open(self._cache_path, "r") as f:
+                    self._image_cache = json.load(f)
+                logger.info(f"Loaded embedding cache: {len(self._image_cache)} images")
+            except Exception as e:
+                logger.warning(f"Failed to load embedding cache: {e}")
+                self._image_cache = {}
+
+    def _save_cache(self):
+        """Save per-image embedding cache."""
+        try:
+            with open(self._cache_path, "w") as f:
+                json.dump(self._image_cache, f)
+        except Exception as e:
+            logger.warning(f"Failed to save embedding cache: {e}")
+
+    def _image_cache_key(self, img_path: Path) -> str:
+        """Cache key: relative path from faces_dir."""
+        try:
+            return str(img_path.relative_to(self.faces_dir))
+        except ValueError:
+            return str(img_path)
+
     def _load_embeddings(self):
         """Load known face embeddings from file."""
         if self.embeddings_path.exists():
@@ -115,21 +150,46 @@ class FaceRecognizer:
                 self.known_embeddings = None
         else:
             logger.info("No existing embeddings found, will train from images")
-            # Auto-train from existing face images
             self.train_from_images()
+
+    def _get_embedding_for_image(self, img_path: Path) -> Optional[np.ndarray]:
+        """Get embedding for an image, using cache if available."""
+        key = self._image_cache_key(img_path)
+
+        # Check cache first
+        if key in self._image_cache:
+            return np.array(self._image_cache[key], dtype=np.float32)
+
+        # Not cached — run InsightFace
+        if self.app is None:
+            return None
+
+        try:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                return None
+
+            faces = self.app.get(img)
+            if not faces:
+                return None
+
+            face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            if face.normed_embedding is None:
+                return None
+
+            emb = face.normed_embedding
+            # Store in cache
+            self._image_cache[key] = emb.tolist()
+            return emb
+
+        except Exception as e:
+            logger.warning(f"Failed to process {img_path}: {e}")
+            return None
 
     def train_from_images(self) -> int:
         """
-        Train face recognition from existing images in known_faces directory.
-
-        Directory structure:
-            known_faces/
-                person1/
-                    img1.jpg
-                    img2.jpg
-                person2/
-                    img1.jpg
-                    ...
+        Train face recognition from images in known_faces directory.
+        Uses per-image cache so only new images need InsightFace processing.
 
         Returns:
             Number of people trained
@@ -145,8 +205,8 @@ class FaceRecognizer:
         trained_count = 0
         new_names = []
         new_embeddings = []
+        cache_dirty = False
 
-        # Iterate through person folders
         for person_dir in self.faces_dir.iterdir():
             if not person_dir.is_dir():
                 continue
@@ -154,35 +214,26 @@ class FaceRecognizer:
             person_name = person_dir.name
             person_embeddings = []
 
-            logger.info(f"Training face for: {person_name}")
-
-            # Process each image in the folder
             image_files = list(person_dir.glob("*.jpg")) + \
                           list(person_dir.glob("*.jpeg")) + \
                           list(person_dir.glob("*.png"))
 
+            new_count = 0
+            cached_count = 0
+
             for img_path in image_files:
-                try:
-                    # Read image
-                    img = cv2.imread(str(img_path))
-                    if img is None:
-                        continue
+                key = self._image_cache_key(img_path)
+                was_cached = key in self._image_cache
 
-                    # Detect faces
-                    faces = self.app.get(img)
+                emb = self._get_embedding_for_image(img_path)
+                if emb is not None:
+                    person_embeddings.append(emb)
+                    if was_cached:
+                        cached_count += 1
+                    else:
+                        new_count += 1
+                        cache_dirty = True
 
-                    if faces:
-                        # Use largest face
-                        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-
-                        if face.normed_embedding is not None:
-                            person_embeddings.append(face.normed_embedding)
-                            logger.debug(f"  Extracted embedding from {img_path.name}")
-
-                except Exception as e:
-                    logger.warning(f"  Failed to process {img_path}: {e}")
-
-            # Average embeddings for this person
             if person_embeddings:
                 avg_embedding = np.mean(person_embeddings, axis=0)
                 avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
@@ -191,35 +242,45 @@ class FaceRecognizer:
                 new_embeddings.append(avg_embedding)
                 trained_count += 1
 
-                logger.info(f"  Trained {person_name} with {len(person_embeddings)} images")
+                logger.info(
+                    f"Trained {person_name}: {len(person_embeddings)} imgs "
+                    f"({cached_count} cached, {new_count} new)")
 
-        # Update known faces
+        # Replace known faces entirely
         if new_embeddings:
-            if self.known_embeddings is None:
-                self.known_embeddings = np.array(new_embeddings)
-                self.known_names = new_names
-            else:
-                # Merge with existing (avoid duplicates)
-                for name, emb in zip(new_names, new_embeddings):
-                    if name not in self.known_names:
-                        self.known_names.append(name)
-                        self.known_embeddings = np.vstack([self.known_embeddings, emb.reshape(1, -1)])
-                    else:
-                        # Update existing
-                        idx = self.known_names.index(name)
-                        self.known_embeddings[idx] = emb
-
-            # Save updated embeddings
+            self.known_embeddings = np.array(new_embeddings)
+            self.known_names = new_names
             self.save_embeddings()
-            logger.info(f"Training complete: {trained_count} people trained")
+            logger.info(f"Training complete: {trained_count} people")
+
+        # Persist cache if we computed new embeddings
+        if cache_dirty:
+            self._save_cache()
+
+        # Clean stale cache entries (images that were deleted)
+        self._clean_cache()
 
         return trained_count
 
     def retrain_all(self) -> int:
-        """Force retrain all faces from images, replacing existing embeddings."""
+        """Retrain all faces. Uses cache so only new images are processed."""
         self.known_names = []
         self.known_embeddings = None
         return self.train_from_images()
+
+    def _clean_cache(self):
+        """Remove cache entries for images that no longer exist."""
+        to_remove = []
+        for key in self._image_cache:
+            full_path = self.faces_dir / key
+            if not full_path.exists():
+                to_remove.append(key)
+
+        if to_remove:
+            for key in to_remove:
+                del self._image_cache[key]
+            self._save_cache()
+            logger.info(f"Cleaned {len(to_remove)} stale cache entries")
 
     def save_embeddings(self):
         """Save known face embeddings to file."""
@@ -254,7 +315,6 @@ class FaceRecognizer:
         # Crop to person region if provided
         if person_bbox:
             x1, y1, x2, y2 = person_bbox
-            # Add margin
             h, w = frame.shape[:2]
             margin = 20
             x1 = max(0, x1 - margin)
@@ -268,22 +328,18 @@ class FaceRecognizer:
             offset = (0, 0)
 
         try:
-            # Detect and analyze faces
             faces = self.app.get(roi)
 
             if not faces:
                 return None
 
-            # Use largest face (closest to camera)
             face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
-            # Get embedding
             embedding = face.normed_embedding
 
             if embedding is None:
                 return None
 
-            # Adjust face bbox to frame coordinates
             fx1, fy1, fx2, fy2 = face.bbox.astype(int)
             face_bbox = (
                 fx1 + offset[0],
@@ -294,7 +350,6 @@ class FaceRecognizer:
 
             # Match against known faces
             if self.known_embeddings is not None and len(self.known_names) > 0:
-                # Cosine similarity (embeddings are normalized)
                 similarities = np.dot(self.known_embeddings, embedding)
                 best_idx = np.argmax(similarities)
                 best_score = similarities[best_idx]
@@ -332,7 +387,6 @@ class FaceRecognizer:
         now = time.time()
         data = self.unknown_faces[track_id]
 
-        # Check collection interval
         if now - data.last_seen < self.sample_interval:
             return
 
@@ -374,11 +428,9 @@ class FaceRecognizer:
             return False
 
         try:
-            # Average embeddings for robustness
             avg_embedding = np.mean(data.embeddings, axis=0)
             avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
 
-            # Add to known faces
             if self.known_embeddings is None:
                 self.known_embeddings = avg_embedding.reshape(1, -1)
             else:
@@ -388,7 +440,6 @@ class FaceRecognizer:
                 ])
             self.known_names.append(name)
 
-            # Save face images
             person_dir = self.faces_dir / name
             person_dir.mkdir(parents=True, exist_ok=True)
 
@@ -396,10 +447,8 @@ class FaceRecognizer:
                 img_path = person_dir / f"{name}_{int(time.time())}_{i}.jpg"
                 cv2.imwrite(str(img_path), img)
 
-            # Save embeddings
             self.save_embeddings()
 
-            # Clear collected data
             del self.unknown_faces[track_id]
 
             logger.info(f"Registered new face: {name}")

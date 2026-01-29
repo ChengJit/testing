@@ -96,6 +96,8 @@ class VideoCapture:
         buffer_size: int = 1,
         reconnect_delay: float = 5.0,
         use_gstreamer: bool = True,
+        capture_width: int = 0,
+        capture_height: int = 0,
     ):
         self.source = source
         self.width = width
@@ -104,6 +106,9 @@ class VideoCapture:
         self.buffer_size = buffer_size
         self.reconnect_delay = reconnect_delay
         self.use_gstreamer = use_gstreamer
+        # Target capture resolution (0 = no downscale, use native)
+        self.capture_width = capture_width
+        self.capture_height = capture_height
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._buffer = FrameBuffer(maxsize=2)
@@ -187,12 +192,22 @@ class VideoCapture:
         if not self.source.startswith("rtsp://"):
             return None
 
+        # Optional hardware-accelerated downscale via nvvidconv
+        if self.capture_width > 0 and self.capture_height > 0:
+            scale_cap = (
+                f"video/x-raw(memory:NVMM),width={self.capture_width},"
+                f"height={self.capture_height} ! "
+            )
+        else:
+            scale_cap = ""
+
         # GStreamer pipeline optimized for Jetson/RTSP
         pipeline = (
             f"rtspsrc location={self.source} latency=0 ! "
             f"rtph264depay ! h264parse ! "
-            f"nvv4l2decoder ! "  # Hardware decoder on Jetson
+            f"nvv4l2decoder ! "
             f"nvvidconv ! "
+            f"{scale_cap}"
             f"video/x-raw,format=BGRx ! "
             f"videoconvert ! "
             f"video/x-raw,format=BGR ! "
@@ -224,6 +239,17 @@ class VideoCapture:
                 if ret and frame is not None:
                     consecutive_failures = 0
                     self._frame_count += 1
+
+                    # Software downscale if capture size is set and
+                    # the frame is larger (GStreamer may already have
+                    # handled this; this covers the fallback path).
+                    cw, ch = self.capture_width, self.capture_height
+                    if cw > 0 and ch > 0:
+                        fh, fw = frame.shape[:2]
+                        if fw > cw or fh > ch:
+                            frame = cv2.resize(
+                                frame, (cw, ch),
+                                interpolation=cv2.INTER_LINEAR)
 
                     frame_data = FrameData(
                         frame=frame,

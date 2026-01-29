@@ -67,6 +67,11 @@ class JetsonConfig:
     display_fps: int = 30  # Display refresh rate
     queue_size: int = 2  # Frame queue size (smaller = less latency)
 
+    # AI frame scale: downscale factor for AI processing (0.0-1.0)
+    # e.g. 0.5 = process at half resolution (960x540 for 1080p feed)
+    # Lower = faster AI but less accurate detections
+    ai_scale: float = 0.5
+
 
 @dataclass
 class CameraConfig:
@@ -77,6 +82,10 @@ class CameraConfig:
     fps: int = 30
     buffer_size: int = 1  # Minimize latency
     reconnect_delay: float = 5.0  # Seconds before reconnect attempt
+    # Capture resolution: downscale the feed at capture time.
+    # Set to e.g. 960x540 for half-res.  0 = use native stream resolution.
+    capture_width: int = 960
+    capture_height: int = 540
 
 
 @dataclass
@@ -222,11 +231,14 @@ class Config:
                 "use_tensorrt": self.jetson.use_tensorrt,
                 "fp16_inference": self.jetson.fp16_inference,
                 "process_fps": self.jetson.process_fps,
+                "ai_scale": self.jetson.ai_scale,
             },
             "camera": {
                 "source": self.camera.source,
                 "width": self.camera.width,
                 "height": self.camera.height,
+                "capture_width": self.camera.capture_width,
+                "capture_height": self.camera.capture_height,
             },
             "zone": {
                 "roi_x1": self.zone.roi_x1,
