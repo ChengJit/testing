@@ -16,6 +16,7 @@ import numpy as np
 
 from .config import Config
 from .detectors import PersonDetector, FaceRecognizer, BoxDetector
+from .detectors.box import TrainingDataCollector
 from .trackers import ByteTracker, TrackedObject
 from .core import ZoneManager, EventManager, EventType, PersonStateMachine
 from .utils import JetsonOptimizer, VideoCapture
@@ -56,11 +57,13 @@ class AIWorker:
         face_recognizer: FaceRecognizer,
         box_detector: BoxDetector,
         process_fps: int = 15,
+        training_collector: Optional[TrainingDataCollector] = None,
     ):
         self.person_detector = person_detector
         self.face_recognizer = face_recognizer
         self.box_detector = box_detector
         self.process_interval = 1.0 / process_fps
+        self.training_collector = training_collector
 
         self._input_queue: Queue = Queue(maxsize=2)
         self._output_queue: Queue = Queue(maxsize=2)
@@ -198,6 +201,16 @@ class AIWorker:
 
             box_detections[track_id] = track_box_info
 
+            # Enqueue to training data collector
+            if self.training_collector:
+                self.training_collector.enqueue(
+                    frame=frame,
+                    person_bbox=track.bbox,
+                    box_detections=carried_boxes,
+                    track_id=track_id,
+                    identity=tracks[track_id].identity,
+                )
+
             # Log box detections
             if carried_boxes:
                 identity = tracks[track_id].identity or f"Track_{track_id}"
@@ -289,12 +302,24 @@ class InventoryMonitor:
             enable_json=True,
         )
 
+        # Initialize training data collector
+        self.training_collector: Optional[TrainingDataCollector] = None
+        if config.training.enabled:
+            self.training_collector = TrainingDataCollector(
+                output_dir=config.training.output_dir,
+                capture_interval=config.training.capture_interval,
+                max_samples=config.training.max_samples,
+                save_full_frame=config.training.save_full_frame,
+                negative_ratio=config.training.negative_ratio,
+            )
+
         # Initialize AI worker
         self.ai_worker = AIWorker(
             person_detector=self.person_detector,
             face_recognizer=self.face_recognizer,
             box_detector=self.box_detector,
             process_fps=optimal["process_fps"],
+            training_collector=self.training_collector,
         )
 
         # Stats
@@ -325,6 +350,10 @@ class InventoryMonitor:
         # Start AI worker
         self.ai_worker.start()
 
+        # Start training data collector
+        if self.training_collector:
+            self.training_collector.start()
+
         self.running = True
         self.start_time = time.time()
 
@@ -334,6 +363,8 @@ class InventoryMonitor:
     def stop(self):
         """Stop the monitoring application."""
         self.running = False
+        if self.training_collector:
+            self.training_collector.stop()
         self.ai_worker.stop()
         self.video.stop()
 
@@ -405,6 +436,24 @@ class InventoryMonitor:
                         logger.info("Retraining faces from images...")
                         count = self.face_recognizer.retrain_all()
                         logger.info(f"Retrained {count} faces")
+                    elif key == ord('d'):
+                        # Toggle training data collection
+                        if self.training_collector:
+                            self.training_collector.stop()
+                            self.training_collector = None
+                            self.ai_worker.training_collector = None
+                            logger.info("Training data collection DISABLED")
+                        else:
+                            self.training_collector = TrainingDataCollector(
+                                output_dir=self.config.training.output_dir,
+                                capture_interval=self.config.training.capture_interval,
+                                max_samples=self.config.training.max_samples,
+                                save_full_frame=self.config.training.save_full_frame,
+                                negative_ratio=self.config.training.negative_ratio,
+                            )
+                            self.training_collector.start()
+                            self.ai_worker.training_collector = self.training_collector
+                            logger.info("Training data collection ENABLED")
 
                 # Memory cleanup periodically
                 if self.frame_count % self.config.jetson.clear_cache_interval == 0:
@@ -596,7 +645,8 @@ class InventoryMonitor:
                 y += 22
 
         # Instructions bar at bottom
-        instructions = "Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain"
+        data_status = "ON" if self.training_collector else "OFF"
+        instructions = f"Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain | D:Data({data_status})"
         cv2.rectangle(display, (0, h - 25), (w, h), (50, 50, 50), -1)
         cv2.putText(display, instructions, (10, h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)

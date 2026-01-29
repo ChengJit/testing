@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(pip show:*)",
+      "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\kafka-web\")",
+      "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\*kafka-web*\")",
+      "Bash(wc:*)",
+      "Bash(cd:*)"
     ]
   }
 }

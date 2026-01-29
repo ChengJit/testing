@@ -106,6 +106,17 @@ class ZoneConfig:
 
 
 @dataclass
+class TrainingConfig:
+    """Training data collection configuration."""
+    enabled: bool = False
+    output_dir: str = "training_queue"
+    capture_interval: int = 30  # frames between captures per track
+    max_samples: int = 5000
+    save_full_frame: bool = False
+    negative_ratio: float = 0.5  # target ratio of negative samples
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     detection: DetectionConfig = field(default_factory=DetectionConfig)
@@ -114,6 +125,7 @@ class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     zone: ZoneConfig = field(default_factory=ZoneConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # Paths
     data_dir: Path = field(default_factory=lambda: Path("data"))
@@ -165,6 +177,11 @@ class Config:
                 for k, v in data["zone"].items():
                     if hasattr(config.zone, k):
                         setattr(config.zone, k, v)
+
+            if "training" in data:
+                for k, v in data["training"].items():
+                    if hasattr(config.training, k):
+                        setattr(config.training, k, v)
 
         return config
 

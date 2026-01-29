@@ -3,9 +3,14 @@ Box detection using multiple methods optimized for Jetson.
 Combines YOLO detection with color-based fallback.
 """
 
+import json
 import logging
+import threading
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from datetime import datetime
+from queue import Queue, Empty, Full
+from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
 
 import numpy as np
@@ -461,3 +466,277 @@ class BoxDetector:
             return False
 
         return True
+
+
+class TrainingDataCollector:
+    """
+    Background training data collector for box detection.
+
+    Captures positive (person carrying box) and negative (person not carrying box)
+    samples into a structured directory for later verification and model retraining.
+    """
+
+    def __init__(
+        self,
+        output_dir: str = "training_queue",
+        capture_interval: int = 30,
+        max_samples: int = 5000,
+        save_full_frame: bool = False,
+        negative_ratio: float = 0.5,
+    ):
+        self.output_dir = Path(output_dir)
+        self.capture_interval = capture_interval
+        self.max_samples = max_samples
+        self.save_full_frame = save_full_frame
+        self.negative_ratio = negative_ratio
+
+        self._queue: Queue = Queue(maxsize=100)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._sample_counter = 0
+        self._track_frame_counts: Dict[int, int] = {}
+        self._lock = threading.Lock()
+
+        # Setup directories
+        self._images_dir = self.output_dir / "images"
+        self._labels_dir = self.output_dir / "labels"
+        self._manifest_path = self.output_dir / "manifest.jsonl"
+
+    def start(self):
+        """Start the collector background thread."""
+        if self._running:
+            return
+
+        # Create output directories
+        self._images_dir.mkdir(parents=True, exist_ok=True)
+        self._labels_dir.mkdir(parents=True, exist_ok=True)
+
+        # Count existing samples from manifest
+        if self._manifest_path.exists():
+            with open(self._manifest_path, "r") as f:
+                self._sample_counter = sum(1 for _ in f)
+
+        self._running = True
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"TrainingDataCollector started, output: {self.output_dir}")
+
+    def stop(self):
+        """Stop the collector background thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        logger.info(
+            f"TrainingDataCollector stopped, {self._sample_counter} total samples"
+        )
+
+    def enqueue(
+        self,
+        frame: np.ndarray,
+        person_bbox: Tuple[int, int, int, int],
+        box_detections: list,
+        track_id: int,
+        identity: Optional[str] = None,
+    ):
+        """
+        Enqueue a sample for collection. Non-blocking; drops if queue is full.
+
+        Args:
+            frame: Full BGR frame
+            person_bbox: Person bounding box (x1, y1, x2, y2)
+            box_detections: List of BoxDetection (or BoxInfo) for this person
+            track_id: Tracker ID for this person
+            identity: Recognized identity name, if any
+        """
+        if not self._running:
+            return
+
+        # Check capture interval for this track
+        with self._lock:
+            count = self._track_frame_counts.get(track_id, 0)
+            if count % self.capture_interval != 0:
+                self._track_frame_counts[track_id] = count + 1
+                return
+            self._track_frame_counts[track_id] = count + 1
+
+        try:
+            self._queue.put_nowait((
+                frame.copy(),
+                person_bbox,
+                box_detections,
+                track_id,
+                identity,
+                time.time(),
+            ))
+        except Full:
+            pass
+
+    def _worker_loop(self):
+        """Background thread loop that processes queued samples."""
+        while self._running:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            try:
+                self._process_sample(*item)
+            except Exception as e:
+                logger.error(f"TrainingDataCollector error: {e}")
+
+    def _process_sample(
+        self,
+        frame: np.ndarray,
+        person_bbox: Tuple[int, int, int, int],
+        box_detections: list,
+        track_id: int,
+        identity: Optional[str],
+        timestamp: float,
+    ):
+        """Process and save a single training sample."""
+        box_count = len(box_detections)
+        is_positive = box_count > 0
+        label = "has_box" if is_positive else "no_box"
+
+        # Enforce negative ratio: skip some negatives if we have too many
+        if not is_positive:
+            pos_count, neg_count = self._count_label_balance()
+            total = pos_count + neg_count
+            if total > 0 and neg_count / total > self.negative_ratio:
+                return
+
+        # Auto-rotate if at max samples
+        if self._sample_counter >= self.max_samples:
+            self._rotate_oldest()
+
+        self._sample_counter += 1
+        prefix = "pos" if is_positive else "neg"
+        filename = f"{prefix}_{self._sample_counter:05d}_track{track_id}"
+
+        # Crop person region
+        x1, y1, x2, y2 = person_bbox
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return
+
+        # Save crop image
+        img_path = self._images_dir / f"{filename}.jpg"
+        cv2.imwrite(str(img_path), crop)
+
+        # Save full frame if configured
+        if self.save_full_frame:
+            full_path = self._images_dir / f"{filename}_full.jpg"
+            cv2.imwrite(str(full_path), frame)
+
+        # Save YOLO-format label (class x_center y_center width height, normalized)
+        label_path = self._labels_dir / f"{filename}.txt"
+        crop_h, crop_w = crop.shape[:2]
+        with open(label_path, "w") as f:
+            class_id = 0 if is_positive else 1
+            # For the crop, the person is the entire image; write box detections relative to crop
+            for det in box_detections:
+                bbox = det.bbox if hasattr(det, "bbox") else (0, 0, crop_w, crop_h)
+                bx1, by1, bx2, by2 = bbox
+                # Make relative to crop
+                bx1_rel = max(0, bx1 - x1) / crop_w
+                by1_rel = max(0, by1 - y1) / crop_h
+                bx2_rel = min(crop_w, bx2 - x1) / crop_w
+                by2_rel = min(crop_h, by2 - y1) / crop_h
+                cx = (bx1_rel + bx2_rel) / 2
+                cy = (by1_rel + by2_rel) / 2
+                bw = bx2_rel - bx1_rel
+                bh = by2_rel - by1_rel
+                f.write(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            if not box_detections:
+                # Negative sample: no annotations
+                pass
+
+        # Build detection methods and confidence info
+        methods = []
+        confidences = []
+        for det in box_detections:
+            if hasattr(det, "detection_method"):
+                methods.append(det.detection_method)
+            elif hasattr(det, "method"):
+                methods.append(det.method)
+            if hasattr(det, "confidence"):
+                confidences.append(det.confidence)
+
+        # Write manifest entry
+        manifest_entry = {
+            "path": str(img_path),
+            "label": label,
+            "timestamp": datetime.fromtimestamp(timestamp).isoformat(),
+            "track_id": track_id,
+            "identity": identity,
+            "box_count": box_count,
+            "methods": methods,
+            "confidences": confidences,
+            "verified": False,
+        }
+
+        with open(self._manifest_path, "a") as f:
+            f.write(json.dumps(manifest_entry) + "\n")
+
+    def _count_label_balance(self) -> Tuple[int, int]:
+        """Count positive and negative samples from manifest."""
+        pos = 0
+        neg = 0
+        if not self._manifest_path.exists():
+            return pos, neg
+        try:
+            with open(self._manifest_path, "r") as f:
+                for line in f:
+                    entry = json.loads(line)
+                    if entry.get("label") == "has_box":
+                        pos += 1
+                    else:
+                        neg += 1
+        except Exception:
+            pass
+        return pos, neg
+
+    def _rotate_oldest(self):
+        """Remove oldest unverified sample to make room."""
+        if not self._manifest_path.exists():
+            return
+
+        lines = []
+        try:
+            with open(self._manifest_path, "r") as f:
+                lines = f.readlines()
+        except Exception:
+            return
+
+        # Find and remove the first unverified entry
+        new_lines = []
+        removed = False
+        for line in lines:
+            if removed:
+                new_lines.append(line)
+                continue
+            try:
+                entry = json.loads(line)
+                if not entry.get("verified", False):
+                    # Delete associated files
+                    img_path = Path(entry["path"])
+                    if img_path.exists():
+                        img_path.unlink()
+                    label_path = self._labels_dir / (img_path.stem + ".txt")
+                    if label_path.exists():
+                        label_path.unlink()
+                    removed = True
+                    continue
+            except Exception:
+                pass
+            new_lines.append(line)
+
+        if removed:
+            with open(self._manifest_path, "w") as f:
+                f.writelines(new_lines)
+            self._sample_counter = len(new_lines)
