@@ -19,12 +19,15 @@
   "jetson": {
     "use_tensorrt": true,
     "fp16_inference": true,
-    "process_fps": 15
+    "process_fps": 15,
+    "ai_scale": 0.5
   },
   "camera": {
     "source": "rtsp://fasspay:fasspay2025@192.168.122.127:554/stream1",
     "width": 1920,
-    "height": 1080
+    "height": 1080,
+    "capture_width": 960,
+    "capture_height": 540
   },
   "display": {
     "width": 1920,
@@ -38,7 +41,7 @@
     "roi_y1": 0.0,
     "roi_x2": 1.0,
     "roi_y2": 1.0,
-    "door_line": 0.5,
-    "enter_direction_down": true
+    "door_line": 0.7,
+    "enter_direction_down": false
   }
 }

@@ -778,9 +778,23 @@ class InventoryMonitor:
             # Direction arrow
             direction = track.get_direction()
             if direction:
+                # get_direction() assumes down=entering; flip label
+                # if config says entering is moving up
+                enter_down = self.config.zone.enter_direction_down
+                if not enter_down:
+                    # Invert the label: tracker said "entering" (moving down)
+                    # but config says moving down = exiting
+                    if direction == "entering":
+                        direction = "exiting"
+                    else:
+                        direction = "entering"
+
                 cx, cy = track.center
                 arrow_color = (0, 255, 0) if direction == "entering" else (0, 0, 255)
-                dy = 40 if direction == "entering" else -40
+                # Arrow points in actual movement direction (from position history)
+                y_positions = [p[1] for p in list(track.position_history)[-5:]]
+                moving_down = (y_positions[-1] - y_positions[0]) > 0 if len(y_positions) >= 2 else True
+                dy = 40 if moving_down else -40
                 cv2.arrowedLine(display, (cx, cy), (cx, cy + dy), arrow_color, 3)
                 dir_label = "ENTERING" if direction == "entering" else "EXITING"
                 cv2.putText(display, dir_label, (cx - 40, cy + dy + (20 if dy > 0 else -10)),
