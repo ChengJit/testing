@@ -414,22 +414,52 @@ class BoxDetector:
 
         return intersection / union if union > 0 else 0
 
+    def assign_boxes_to_persons(
+        self,
+        all_boxes: List[BoxDetection],
+        person_bboxes: Dict[int, Tuple[int, int, int, int]],
+    ) -> Dict[int, List[BoxDetection]]:
+        """
+        Assign pre-detected boxes to tracked persons by spatial overlap.
+
+        Args:
+            all_boxes: All box detections from a single detect() call
+            person_bboxes: Mapping of track_id -> person bounding box
+
+        Returns:
+            Dict mapping track_id -> list of carried boxes
+        """
+        result: Dict[int, List[BoxDetection]] = {tid: [] for tid in person_bboxes}
+
+        for box in all_boxes:
+            for tid, pbbox in person_bboxes.items():
+                if self._is_carried_by(box.bbox, pbbox):
+                    result[tid].append(box)
+                    break  # each box assigned to at most one person
+
+        return result
+
     def detect_carried_boxes(
         self,
         frame: np.ndarray,
-        person_bbox: Tuple[int, int, int, int]
+        person_bbox: Tuple[int, int, int, int],
+        precomputed_boxes: Optional[List[BoxDetection]] = None,
     ) -> List[BoxDetection]:
         """
         Detect boxes being carried by a specific person.
 
         Args:
-            frame: BGR image
+            frame: BGR image (unused if precomputed_boxes provided)
             person_bbox: Person bounding box
+            precomputed_boxes: Optional pre-detected boxes to filter instead of re-running detection
 
         Returns:
             List of boxes associated with this person
         """
-        all_boxes = self.detect(frame, [person_bbox])
+        if precomputed_boxes is not None:
+            all_boxes = precomputed_boxes
+        else:
+            all_boxes = self.detect(frame, [person_bbox])
 
         carried = []
         for box in all_boxes:

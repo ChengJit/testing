@@ -4,28 +4,36 @@ Inventory Door Monitor - Entry Point
 =====================================
 
 Monitors people entering/exiting an inventory room and counts boxes they carry.
-Optimized for Jetson Orin Nano.
+Uses face recognition to identify individuals and supports live correction.
 
 Usage:
-    python run_monitor.py                    # Use default config
+    python run_monitor.py                    # Run with GUI (default)
+    python run_monitor.py --gui              # Explicitly run with GUI
     python run_monitor.py -s rtsp://...      # Specify camera source
     python run_monitor.py --headless         # Run without display
     python run_monitor.py --setup            # Interactive setup wizard
+    python run_monitor.py --train            # Train face recognition
+    python run_monitor.py --status           # Show system status
 
-Controls (when display is shown):
+Controls (GUI mode):
     Q - Quit
     Z - Toggle zone visualization
     S - Toggle statistics overlay
-    R - Register unknown face
+    B - Toggle box detection overlay
+    R - Register unknown face (console prompt)
+    C - Correct face identity (in-window typing)
+    T - Retrain face embeddings
+    D - Toggle training data collection
 """
 
 import sys
 import os
+import logging
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from inventory_monitor.app import main, InventoryMonitor
+from inventory_monitor.app import InventoryMonitor
 from inventory_monitor.config import Config
 from inventory_monitor.utils import get_gpu_info
 from inventory_monitor.detectors import FaceRecognizer
@@ -171,6 +179,8 @@ if __name__ == "__main__":
                         help="Path to config file")
     parser.add_argument("--source", "-s",
                         help="Video source (RTSP URL or device ID)")
+    parser.add_argument("--gui", action="store_true", default=True,
+                        help="Run with GUI display (default)")
     parser.add_argument("--headless", action="store_true",
                         help="Run without display window")
     parser.add_argument("--debug", action="store_true",
@@ -191,5 +201,29 @@ if __name__ == "__main__":
     elif args.train:
         train_faces()
     else:
-        # Run the main application
-        main()
+        # Setup logging
+        log_level = logging.DEBUG if args.debug else logging.INFO
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S"
+        )
+
+        # Load config
+        config = Config.load(args.config)
+
+        # Apply CLI overrides
+        if args.source:
+            config.camera.source = args.source
+        if args.headless:
+            config.headless = True
+        if args.debug:
+            config.debug = True
+
+        # --gui is the default; --headless overrides it
+        if not args.headless:
+            config.headless = False
+
+        # Run monitor
+        monitor = InventoryMonitor(config)
+        monitor.run()

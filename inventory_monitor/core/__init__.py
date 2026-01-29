@@ -1,11 +1,9 @@
-"""Core modules for zone management and event handling."""
+"""Core modules for event handling and person state tracking."""
 
-from .zone_manager import ZoneManager, Zone, PersonZoneState
 from .event_manager import EventManager, InventoryEvent, EventType
-from .state_machine import PersonStateMachine, PersonState
+from .state_machine import PersonStateMachine, PersonState, PersonContext
 
 __all__ = [
-    "ZoneManager", "Zone", "PersonZoneState",
     "EventManager", "InventoryEvent", "EventType",
-    "PersonStateMachine", "PersonState"
+    "PersonStateMachine", "PersonState", "PersonContext",
 ]

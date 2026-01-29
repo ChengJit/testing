@@ -1,12 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(tree:*)",
-      "Bash(pip show:*)",
-      "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\kafka-web\")",
-      "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\*kafka-web*\")",
-      "Bash(wc:*)",
-      "Bash(cd:*)"
+      "Bash(dir \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing\")",
+      "Bash(dir /s /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing\")",
+      "Bash(git ls-tree:*)",
+      "Bash(dir /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing\")",
+      "Bash(git checkout:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing\\\\inventory_monitor\"\" 2>&1 || ls -la \"/c/Users/Cheng Jit Giam/testing/inventory_monitor/ \")"
     ]
   }
 }

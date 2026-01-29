@@ -10,15 +10,16 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from queue import Queue, Empty
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .config import Config
 from .detectors import PersonDetector, FaceRecognizer, BoxDetector
-from .detectors.box import TrainingDataCollector
+from .detectors.box import TrainingDataCollector, BoxDetection
 from .trackers import ByteTracker, TrackedObject
-from .core import ZoneManager, EventManager, EventType, PersonStateMachine
+from .core import EventManager, EventType, PersonStateMachine, PersonContext
 from .utils import JetsonOptimizer, VideoCapture
 
 logger = logging.getLogger(__name__)
@@ -164,11 +165,9 @@ class AIWorker:
         faces = {}
         for track_id, track in tracks.items():
             if track.identity_locked:
-                # Already identified
                 faces[track_id] = (track.identity, track.identity_confidence)
                 continue
 
-            # Run face recognition
             face_match = self.face_recognizer.recognize(
                 frame,
                 person_bbox=track.bbox,
@@ -178,18 +177,24 @@ class AIWorker:
             if face_match and face_match.name != "Unknown":
                 faces[track_id] = (face_match.name, face_match.confidence)
 
-        # 3. Box detection for each person
+        # 3. Box detection - run ONCE for the whole frame
+        person_bboxes_list = [track.bbox for track in tracks.values()]
+        all_box_detections = self.box_detector.detect(frame, person_bboxes_list or None)
+
+        # 4. Assign boxes to persons by spatial overlap
+        person_bboxes_map = {tid: track.bbox for tid, track in tracks.items()}
+        assigned = self.box_detector.assign_boxes_to_persons(all_box_detections, person_bboxes_map)
+
         boxes = {}
         box_detections = {}
         all_boxes = []
 
         for track_id, track in tracks.items():
-            carried_boxes = self.box_detector.detect_carried_boxes(frame, track.bbox)
-            boxes[track_id] = len(carried_boxes)
+            carried = assigned.get(track_id, [])
+            boxes[track_id] = len(carried)
 
-            # Store detailed box info
             track_box_info = []
-            for box in carried_boxes:
+            for box in carried:
                 box_info = BoxInfo(
                     bbox=box.bbox,
                     confidence=box.confidence,
@@ -206,17 +211,16 @@ class AIWorker:
                 self.training_collector.enqueue(
                     frame=frame,
                     person_bbox=track.bbox,
-                    box_detections=carried_boxes,
+                    box_detections=carried,
                     track_id=track_id,
                     identity=tracks[track_id].identity,
                 )
 
-            # Log box detections
-            if carried_boxes:
+            if carried:
                 identity = tracks[track_id].identity or f"Track_{track_id}"
                 logger.info(
-                    f"[BOX] {identity} carrying {len(carried_boxes)} box(es): "
-                    f"{[f'{b.class_name}({b.confidence:.0%})' for b in carried_boxes]}"
+                    f"[BOX] {identity} carrying {len(carried)} box(es): "
+                    f"{[f'{b.class_name}({b.confidence:.0%})' for b in carried]}"
                 )
 
         processing_time = (time.time() - start_time) * 1000
@@ -293,8 +297,7 @@ class InventoryMonitor:
             match_thresh=config.tracking.match_thresh,
         )
 
-        # Initialize managers (will be set after first frame)
-        self.zone_manager: Optional[ZoneManager] = None
+        # Initialize state machine (will be set after first frame)
         self.state_machine: Optional[PersonStateMachine] = None
         self.event_manager = EventManager(
             log_dir=str(config.log_dir),
@@ -333,6 +336,14 @@ class InventoryMonitor:
         self.show_boxes = config.display.show_boxes
         self.display_width = config.display.width
         self.display_height = config.display.height
+
+        # GUI face correction state
+        self._correction_mode = False
+        self._correction_track_ids: List[int] = []
+        self._correction_index = 0
+        self._correction_input = ""
+        self._frame_height = 0
+        self._frame_width = 0
 
     def start(self):
         """Start the monitoring application."""
@@ -388,9 +399,11 @@ class InventoryMonitor:
 
                 self.frame_count += 1
 
-                # Initialize zone/state managers on first frame
-                if self.zone_manager is None:
+                # Initialize state machine on first frame
+                if self.state_machine is None:
                     h, w = frame.shape[:2]
+                    self._frame_height = h
+                    self._frame_width = w
                     self._init_managers(h, w)
 
                 # Submit to AI worker
@@ -411,7 +424,7 @@ class InventoryMonitor:
                 if not self.config.headless:
                     display_frame = self._draw_overlay(frame)
 
-                    # Resize to 1080p for display
+                    # Resize to display dimensions
                     display_frame = cv2.resize(
                         display_frame,
                         (self.display_width, self.display_height),
@@ -421,39 +434,7 @@ class InventoryMonitor:
                     cv2.imshow("Inventory Monitor", display_frame)
 
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('z'):
-                        self.show_zones = not self.show_zones
-                    elif key == ord('s'):
-                        self.show_stats = not self.show_stats
-                    elif key == ord('b'):
-                        self.show_boxes = not self.show_boxes
-                    elif key == ord('r'):
-                        self._handle_registration()
-                    elif key == ord('t'):
-                        # Retrain faces from images
-                        logger.info("Retraining faces from images...")
-                        count = self.face_recognizer.retrain_all()
-                        logger.info(f"Retrained {count} faces")
-                    elif key == ord('d'):
-                        # Toggle training data collection
-                        if self.training_collector:
-                            self.training_collector.stop()
-                            self.training_collector = None
-                            self.ai_worker.training_collector = None
-                            logger.info("Training data collection DISABLED")
-                        else:
-                            self.training_collector = TrainingDataCollector(
-                                output_dir=self.config.training.output_dir,
-                                capture_interval=self.config.training.capture_interval,
-                                max_samples=self.config.training.max_samples,
-                                save_full_frame=self.config.training.save_full_frame,
-                                negative_ratio=self.config.training.negative_ratio,
-                            )
-                            self.training_collector.start()
-                            self.ai_worker.training_collector = self.training_collector
-                            logger.info("Training data collection ENABLED")
+                    self._handle_key(key)
 
                 # Memory cleanup periodically
                 if self.frame_count % self.config.jetson.clear_cache_interval == 0:
@@ -465,24 +446,57 @@ class InventoryMonitor:
             self.stop()
             cv2.destroyAllWindows()
 
-    def _init_managers(self, height: int, width: int):
-        """Initialize zone and state managers."""
-        door_y = int(self.config.zone.door_line * height)
+    def _handle_key(self, key: int):
+        """Handle keyboard input for GUI controls."""
+        if self._correction_mode:
+            self._handle_correction_key(key)
+            return
 
-        self.zone_manager = ZoneManager(
-            frame_height=height,
-            frame_width=width,
-            door_line=self.config.zone.door_line,
-            enter_direction_down=self.config.zone.enter_direction_down,
-            direction_frames=self.config.tracking.direction_frames,
-        )
+        if key == ord('q'):
+            self.running = False
+        elif key == ord('z'):
+            self.show_zones = not self.show_zones
+        elif key == ord('s'):
+            self.show_stats = not self.show_stats
+        elif key == ord('b'):
+            self.show_boxes = not self.show_boxes
+        elif key == ord('r'):
+            self._handle_registration()
+        elif key == ord('t'):
+            logger.info("Retraining faces from images...")
+            count = self.face_recognizer.retrain_all()
+            logger.info(f"Retrained {count} faces")
+        elif key == ord('c'):
+            self._enter_correction_mode()
+        elif key == ord('d'):
+            # Toggle training data collection
+            if self.training_collector:
+                self.training_collector.stop()
+                self.training_collector = None
+                self.ai_worker.training_collector = None
+                logger.info("Training data collection DISABLED")
+            else:
+                self.training_collector = TrainingDataCollector(
+                    output_dir=self.config.training.output_dir,
+                    capture_interval=self.config.training.capture_interval,
+                    max_samples=self.config.training.max_samples,
+                    save_full_frame=self.config.training.save_full_frame,
+                    negative_ratio=self.config.training.negative_ratio,
+                )
+                self.training_collector.start()
+                self.ai_worker.training_collector = self.training_collector
+                logger.info("Training data collection ENABLED")
+
+    def _init_managers(self, height: int, width: int):
+        """Initialize state machine for door crossing detection."""
+        door_y = int(self.config.zone.door_line * height)
 
         self.state_machine = PersonStateMachine(
             door_y=door_y,
             enter_direction_down=self.config.zone.enter_direction_down,
         )
 
-        logger.info(f"Managers initialized for {width}x{height} frame")
+        logger.info(f"State machine initialized for {width}x{height} frame, door_y={door_y}")
 
     def _process_ai_result(self, result: ProcessingResult):
         """Process AI result and update state."""
@@ -498,8 +512,8 @@ class InventoryMonitor:
             if track_id in result.boxes:
                 track.update_box_count(result.boxes[track_id])
 
-            # Update zone/state
-            if self.zone_manager and self.state_machine:
+            # Update state machine
+            if self.state_machine:
                 event = self.state_machine.update(
                     track_id=track_id,
                     center=track.center,
@@ -527,57 +541,122 @@ class InventoryMonitor:
                         entry_box_count=ctx.entry_box_count if ctx else 0,
                     )
 
+    # ---- GUI Face Correction ----
+
+    def _enter_correction_mode(self):
+        """Enter face correction mode. Selects tracked persons to correct."""
+        tracks = self.tracker.get_confirmed_tracks()
+        if not tracks:
+            logger.info("No tracked persons to correct")
+            return
+        self._correction_track_ids = list(tracks.keys())
+        self._correction_index = 0
+        self._correction_input = ""
+        self._correction_mode = True
+        logger.info(f"Correction mode: {len(self._correction_track_ids)} persons. "
+                     "Tab=next, type name + Enter to assign, Esc to cancel")
+
+    def _handle_correction_key(self, key: int):
+        """Handle keyboard input while in correction mode."""
+        if key == 27:  # Esc
+            self._correction_mode = False
+            self._correction_input = ""
+            logger.info("Correction mode cancelled")
+        elif key == 9:  # Tab - cycle to next track
+            self._correction_index = (self._correction_index + 1) % len(self._correction_track_ids)
+            self._correction_input = ""
+        elif key == 13:  # Enter - commit correction
+            if self._correction_input.strip():
+                self._apply_correction(self._correction_input.strip())
+            self._correction_input = ""
+        elif key == 8:  # Backspace
+            self._correction_input = self._correction_input[:-1]
+        elif 32 <= key < 127:  # Printable ASCII
+            self._correction_input += chr(key)
+
+    def _apply_correction(self, name: str):
+        """Apply a face identity correction: save images and update identity."""
+        if not self._correction_track_ids:
+            return
+
+        track_id = self._correction_track_ids[self._correction_index]
+        tracks = self.tracker.get_confirmed_tracks()
+        track = tracks.get(track_id)
+
+        if track is None:
+            logger.warning(f"Track {track_id} no longer active")
+            return
+
+        # Try to save face images from unknown face collection
+        saved = False
+        if self.face_recognizer.get_registration_ready(track_id):
+            saved = self.face_recognizer.register_face(track_id, name)
+        else:
+            # Save any collected images even if not enough for full registration
+            unknown_data = self.face_recognizer.unknown_faces.get(track_id)
+            if unknown_data and unknown_data.images:
+                person_dir = Path(self.config.faces_dir) / name
+                person_dir.mkdir(parents=True, exist_ok=True)
+                for i, img in enumerate(unknown_data.images):
+                    img_path = person_dir / f"{name}_{int(time.time())}_{i}.jpg"
+                    cv2.imwrite(str(img_path), img)
+                saved = True
+                logger.info(f"Saved {len(unknown_data.images)} images for {name}")
+
+        # Update track identity
+        track.set_identity(name, 1.0, lock=True)
+
+        if saved:
+            # Auto-retrain embeddings after correction
+            logger.info(f"Corrected track {track_id} -> {name}, retraining embeddings...")
+            self.face_recognizer.retrain_all()
+        else:
+            logger.info(f"Corrected track {track_id} -> {name} (no face images saved)")
+
+        self._correction_mode = False
+
+    # ---- Drawing ----
+
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
         """Draw visualization overlay on frame."""
         display = frame.copy()
         h, w = display.shape[:2]
 
-        # Draw zones
-        if self.show_zones and self.zone_manager:
-            zone_info = self.zone_manager.get_zone_info()
+        # Draw door line and zones
+        if self.show_zones and self.state_machine:
+            door_y = self.state_machine.door_y
+            threshold = self.state_machine.door_threshold
 
             # Door line
-            cv2.line(display, (0, zone_info["door_line"]), (w, zone_info["door_line"]),
-                     (0, 255, 255), 2)
-            cv2.putText(display, "DOOR LINE", (10, zone_info["door_line"] - 5),
+            cv2.line(display, (0, door_y), (w, door_y), (0, 255, 255), 2)
+            cv2.putText(display, "DOOR LINE", (10, door_y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-            # Entry zone
+            # Door threshold zones
             cv2.rectangle(display,
-                          (0, zone_info["entry_zone"][0]),
-                          (w, zone_info["entry_zone"][1]),
+                          (0, door_y - threshold),
+                          (w, door_y),
                           (0, 255, 0), 1)
-
-            # Exit zone
             cv2.rectangle(display,
-                          (0, zone_info["exit_zone"][0]),
-                          (w, zone_info["exit_zone"][1]),
+                          (0, door_y),
+                          (w, door_y + threshold),
                           (0, 0, 255), 1)
 
         # Draw detected boxes
         if self.show_boxes and self.last_ai_result:
             for box_info in self.last_ai_result.all_boxes:
                 bx1, by1, bx2, by2 = box_info.bbox
-
-                # Cyan color for boxes
                 box_color = (255, 255, 0)  # Cyan
-
-                # Draw box bounding box
                 cv2.rectangle(display, (bx1, by1), (bx2, by2), box_color, 2)
-
-                # Draw box label
                 box_label = f"{box_info.class_name} {box_info.confidence:.0%}"
                 cv2.putText(display, box_label, (bx1, by1 - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-
-                # Draw detection method indicator
                 method_short = box_info.method[:3].upper()
                 cv2.putText(display, method_short, (bx2 - 30, by2 - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1)
 
         # Draw tracked persons
         tracks = self.tracker.get_confirmed_tracks()
-
         for track_id, track in tracks.items():
             x1, y1, x2, y2 = track.bbox
 
@@ -589,21 +668,30 @@ class InventoryMonitor:
             else:
                 color = (0, 165, 255)  # Orange - unknown
 
-            # Bounding box
+            # Highlight selected track in correction mode
+            if self._correction_mode and self._correction_track_ids:
+                selected_tid = self._correction_track_ids[self._correction_index]
+                if track_id == selected_tid:
+                    color = (255, 0, 255)  # Magenta for selected
+                    cv2.rectangle(display, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), color, 3)
+
             cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
 
             # Label
             name = track.identity or f"ID:{track_id}"
             conf_str = f"{track.identity_confidence:.0%}" if track.identity else ""
             box_str = f" [{track.box_count} box]" if track.box_count > 0 else ""
-
             label = f"{name} {conf_str}{box_str}".strip()
 
-            # Draw label background for readability
             (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(display, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
             cv2.putText(display, label, (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # Carrying indicator
+            if track.box_count > 0:
+                cv2.putText(display, "CARRYING", (x1, y2 + 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Direction arrow
             direction = track.get_direction()
@@ -612,8 +700,6 @@ class InventoryMonitor:
                 arrow_color = (0, 255, 0) if direction == "entering" else (0, 0, 255)
                 dy = 40 if direction == "entering" else -40
                 cv2.arrowedLine(display, (cx, cy), (cx, cy + dy), arrow_color, 3)
-
-                # Direction label
                 dir_label = "ENTERING" if direction == "entering" else "EXITING"
                 cv2.putText(display, dir_label, (cx - 40, cy + dy + (20 if dy > 0 else -10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, arrow_color, 2)
@@ -624,7 +710,6 @@ class InventoryMonitor:
             elapsed = time.time() - self.start_time
             fps = self.frame_count / elapsed if elapsed > 0 else 0
 
-            # Semi-transparent background for stats
             overlay = display.copy()
             cv2.rectangle(overlay, (5, 5), (250, 160), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
@@ -644,14 +729,53 @@ class InventoryMonitor:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
                 y += 22
 
+        # Correction mode overlay
+        if self._correction_mode and self._correction_track_ids:
+            self._draw_correction_panel(display)
+
         # Instructions bar at bottom
         data_status = "ON" if self.training_collector else "OFF"
-        instructions = f"Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain | D:Data({data_status})"
+        if self._correction_mode:
+            instructions = "CORRECTION MODE: Tab=next person | Type name + Enter | Esc=cancel"
+        else:
+            instructions = f"Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain | C:Correct | D:Data({data_status})"
         cv2.rectangle(display, (0, h - 25), (w, h), (50, 50, 50), -1)
         cv2.putText(display, instructions, (10, h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         return display
+
+    def _draw_correction_panel(self, display: np.ndarray):
+        """Draw the face correction panel overlay."""
+        h, w = display.shape[:2]
+        panel_w, panel_h = 350, 100
+        px = w - panel_w - 10
+        py = 10
+
+        # Semi-transparent background
+        overlay = display.copy()
+        cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (80, 0, 80), -1)
+        cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
+
+        track_id = self._correction_track_ids[self._correction_index]
+        tracks = self.tracker.get_confirmed_tracks()
+        track = tracks.get(track_id)
+
+        current_name = "N/A"
+        if track:
+            current_name = track.identity or f"Unknown (ID:{track_id})"
+
+        lines = [
+            f"CORRECT IDENTITY ({self._correction_index + 1}/{len(self._correction_track_ids)})",
+            f"Current: {current_name}",
+            f"New name: {self._correction_input}_",
+        ]
+
+        y = py + 25
+        for line in lines:
+            cv2.putText(display, line, (px + 10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y += 25
 
     def _handle_registration(self):
         """Handle face registration for unknown persons."""
@@ -662,7 +786,6 @@ class InventoryMonitor:
                 continue
 
             if self.face_recognizer.get_registration_ready(track_id):
-                # Get name from user
                 name = input(f"Enter name for Track {track_id} (or skip): ").strip()
 
                 if name:
@@ -670,48 +793,3 @@ class InventoryMonitor:
                     if success:
                         track.set_identity(name, 1.0, lock=True)
                         logger.info(f"Registered: {name}")
-
-
-def main():
-    """Entry point for the inventory monitor."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Inventory Door Monitor")
-    parser.add_argument("--config", "-c", default="config.json",
-                        help="Path to config file")
-    parser.add_argument("--source", "-s", help="Video source (overrides config)")
-    parser.add_argument("--headless", action="store_true",
-                        help="Run without display")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
-
-    args = parser.parse_args()
-
-    # Setup logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S"
-    )
-
-    # Load config
-    config = Config.load(args.config)
-
-    if args.source:
-        config.camera.source = args.source
-    if args.headless:
-        config.headless = True
-    if args.debug:
-        config.debug = True
-
-    # Save config for future runs
-    config.save(args.config)
-
-    # Run monitor
-    monitor = InventoryMonitor(config)
-    monitor.run()
-
-
-if __name__ == "__main__":
-    main()
