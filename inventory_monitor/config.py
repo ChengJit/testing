@@ -108,10 +108,12 @@ class ZoneConfig:
     roi_y2: float = 1.0
 
     # Door line position (normalized, where 0=top, 1=bottom)
-    door_line: float = 0.5
+    # Default: camera inside room facing door, door near bottom of frame
+    door_line: float = 0.7
 
     # Direction: True = entering when moving down, False = entering when moving up
-    enter_direction_down: bool = True
+    # Default: camera inside room facing door, so entering = moving up (towards camera)
+    enter_direction_down: bool = False
 
 
 @dataclass
