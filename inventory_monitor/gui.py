@@ -7,6 +7,7 @@ import logging
 import time
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Set
 
@@ -248,6 +249,13 @@ class InventoryGUI:
         # Schedule UI update on main thread
         self.root.after(0, self._append_event_log, line)
 
+        # Save snapshot for all entry/exit events
+        if event.event_type in (EventType.PERSON_ENTERED, EventType.PERSON_EXITED):
+            direction = "entry" if event.event_type == EventType.PERSON_ENTERED else "exit"
+            crop = self._get_track_crop(event.track_id)
+            self.root.after(0, self._save_event_snapshot,
+                            identity, direction, event.box_count, crop)
+
         # If person exited with boxes and is unknown/low-confidence, queue for verification
         if event.event_type == EventType.PERSON_EXITED and event.box_count > 0:
             is_unknown = (not event.identity or event.identity == "Unknown"
@@ -388,8 +396,17 @@ class InventoryGUI:
         # Details
         identity_text = pv.identity if pv.identity and pv.identity != "Unknown" else "Unknown"
         info = (f"Identity: {identity_text} ({pv.identity_confidence:.0%} confidence)\n"
-                f"Exited with {pv.box_count} box(es) | Entered with {pv.entry_box_count}")
+                f"Entered with {pv.entry_box_count} box(es)")
         ttk.Label(dialog, text=info, font=("", 9), justify=tk.CENTER).pack(pady=4)
+
+        # Box count correction
+        box_frame = ttk.Frame(dialog)
+        box_frame.pack(pady=4)
+        ttk.Label(box_frame, text="Boxes on exit:", font=("", 10)).pack(side=tk.LEFT, padx=4)
+        box_var = tk.IntVar(value=pv.box_count)
+        box_spin = ttk.Spinbox(box_frame, from_=0, to=20, textvariable=box_var,
+                               width=5, font=("", 11))
+        box_spin.pack(side=tk.LEFT, padx=4)
 
         # Name input
         ttk.Label(dialog, text="Who is this person?").pack(pady=(8, 2))
@@ -407,18 +424,25 @@ class InventoryGUI:
             name = name_var.get().strip()
             if not name:
                 return  # must provide a name
+            corrected_boxes = box_var.get()
+            pv.box_count = corrected_boxes
             # Save crop & train
             if pv.crop is not None and pv.crop.size > 0:
                 self._save_and_train(pv.track_id, name, pv.crop)
             # Log the identification correction
             self._log_exit_identification(pv, name)
+            # Save snapshot
+            self._save_event_snapshot(name, "exit", corrected_boxes, pv.crop)
             self._confirmed_tracks.add(pv.track_id)
             self._verify_dialog_open = False
             dialog.destroy()
 
         def _skip_unknown():
+            corrected_boxes = box_var.get()
+            pv.box_count = corrected_boxes
             # Log as unknown but still record it
             self._log_exit_identification(pv, "Unknown")
+            self._save_event_snapshot("unknown", "exit", corrected_boxes, pv.crop)
             self._verify_dialog_open = False
             dialog.destroy()
 
@@ -452,6 +476,23 @@ class InventoryGUI:
                     "entry_box_count": pv.entry_box_count,
                 },
             )
+
+    # ================================================================ snapshot saving
+
+    def _save_event_snapshot(self, name: str, direction: str, box_count: int,
+                             crop: Optional[np.ndarray]):
+        """Save a person crop to logs/snapshots/YYYY-MM-DD/ for record keeping."""
+        if crop is None or crop.size == 0:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        snap_dir = self.config.log_dir / "snapshots" / today
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S")
+        safe_name = name.replace(" ", "_") if name else "unknown"
+        filename = f"{safe_name}_{direction}_{box_count}boxes_{ts}.jpg"
+        path = snap_dir / filename
+        cv2.imwrite(str(path), crop)
+        logger.info(f"Saved event snapshot: {path}")
 
     # ================================================================ face verification (low confidence)
 
@@ -525,8 +566,14 @@ class InventoryGUI:
             question = "Unknown person detected"
         ttk.Label(dialog, text=question, font=("", 10)).pack(pady=4)
 
-        box_text = f"Carrying {box_count} box(es)" if box_count > 0 else "No boxes"
-        ttk.Label(dialog, text=box_text, font=("", 9)).pack(pady=2)
+        # Box count correction
+        box_frame = ttk.Frame(dialog)
+        box_frame.pack(pady=4)
+        ttk.Label(box_frame, text="Boxes:", font=("", 10)).pack(side=tk.LEFT, padx=4)
+        box_var = tk.IntVar(value=box_count)
+        box_spin = ttk.Spinbox(box_frame, from_=0, to=20, textvariable=box_var,
+                               width=5, font=("", 11))
+        box_spin.pack(side=tk.LEFT, padx=4)
 
         # Name input
         ttk.Label(dialog, text="Enter name (or correct):").pack(pady=(8, 2))
@@ -545,6 +592,7 @@ class InventoryGUI:
             if name:
                 self._save_and_train(track_id, name, crop)
                 self._confirmed_tracks.add(track_id)
+                self._save_event_snapshot(name, "detected", box_var.get(), crop)
             self._verify_dialog_open = False
             dialog.destroy()
 
