@@ -3,6 +3,7 @@ Simplified Tkinter GUI for the Inventory Door Monitor.
 Focused on: live feed, entry/exit detection with boxes, face verification, and live training.
 """
 
+import json
 import logging
 import time
 import threading
@@ -52,6 +53,17 @@ class PendingVerification:
     timestamp: float
 
 
+@dataclass
+class PendingFaceVerification:
+    """A low-confidence face detection waiting for user verification."""
+    track_id: int
+    suggested_name: str
+    confidence: float
+    crop: np.ndarray
+    box_count: int
+    timestamp: float
+
+
 class InventoryGUI:
     """Simplified GUI: live feed + face verification + entry/exit with boxes."""
 
@@ -78,8 +90,16 @@ class InventoryGUI:
         self._pending_exit_verifications: List[PendingVerification] = []
         self._exit_verify_lock = threading.Lock()
 
+        # Queue of low-confidence face detections needing verification
+        self._pending_face_verifications: List[PendingFaceVerification] = []
+
         # Keep last frame for cropping when exit event fires
         self._last_frame: Optional[np.ndarray] = None
+
+        # Persistence directory for unfinished verifications
+        self._pending_dir = self.config.log_dir / "pending_verifications"
+        self._pending_file = self._pending_dir / "queue.json"
+        self._load_pending_queue()
 
         # Build UI
         self.root = tk.Tk()
@@ -276,7 +296,7 @@ class InventoryGUI:
                     self._pending_exit_verifications.append(pv)
 
     def _get_track_crop(self, track_id: int) -> Optional[np.ndarray]:
-        """Try to crop the person from the last frame."""
+        """Try to crop the person from the last frame with 15% padding."""
         if self._last_frame is None or self.monitor is None:
             return None
         tracks = self.monitor.tracker.get_confirmed_tracks()
@@ -284,9 +304,11 @@ class InventoryGUI:
         if track is None:
             return None
         x1, y1, x2, y2 = track.bbox
+        bw, bh = x2 - x1, y2 - y1
+        pad_x, pad_y = int(bw * 0.15), int(bh * 0.15)
         h, w = self._last_frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+        x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
         crop = self._last_frame[y1:y2, x1:x2].copy()
         return crop if crop.size > 0 else None
 
@@ -311,10 +333,17 @@ class InventoryGUI:
                 pending = self._pop_pending_exit()
                 if pending:
                     self._open_exit_verify_dialog(pending)
-                # Priority 2: low-confidence face verification
-                elif self.monitor.last_ai_result:
-                    self._check_face_verification(
-                        self.monitor.last_ai_result, frame)
+                else:
+                    # Queue new face verifications from latest AI result
+                    if self.monitor.last_ai_result:
+                        self._queue_face_verifications(
+                            self.monitor.last_ai_result, frame)
+                    # Priority 2: pop queued face verification
+                    if self._pending_face_verifications:
+                        pf = self._pending_face_verifications.pop(0)
+                        self._open_verify_dialog(
+                            pf.track_id, pf.suggested_name, pf.confidence,
+                            pf.crop, pf.box_count)
 
             # Draw + show
             try:
@@ -367,6 +396,12 @@ class InventoryGUI:
     def _open_exit_verify_dialog(self, pv: PendingVerification):
         """Mandatory dialog when someone exits with boxes and is unidentified."""
         self._verify_dialog_open = True
+
+        # Log that an exit alert appeared
+        ts = time.strftime("%H:%M:%S")
+        who = pv.identity if pv.identity and pv.identity != "Unknown" else "Unknown"
+        self._append_event_log(
+            f"[{ts}] ALERT: {who} exited with {pv.box_count} box(es) - awaiting ID")
 
         dialog = tk.Toplevel(self.root)
         dialog.title("ALERT: Unknown person exited with boxes!")
@@ -496,53 +531,64 @@ class InventoryGUI:
 
     # ================================================================ face verification (low confidence)
 
-    def _check_face_verification(self, result: ProcessingResult,
-                                 frame: np.ndarray):
-        """Check if any detected face needs user verification."""
+    def _queue_face_verifications(self, result: ProcessingResult,
+                                  frame: np.ndarray):
+        """Queue any low-confidence faces for verification (don't open dialog here)."""
         now = time.time()
         tracks = self.monitor.tracker.get_confirmed_tracks()
+        # Track IDs already queued
+        queued_ids = {pf.track_id for pf in self._pending_face_verifications}
 
         for track_id, (name, conf) in result.faces.items():
-            # Skip if already confirmed by user
             if track_id in self._confirmed_tracks:
                 continue
-
-            # Skip if identity is locked with high confidence
+            if track_id in queued_ids:
+                continue
             track = tracks.get(track_id)
             if track and track.identity_locked:
                 continue
-
-            # Skip if recently prompted
             last_time = self._verified_tracks.get(track_id, 0)
             if now - last_time < self.VERIFY_COOLDOWN:
                 continue
 
-            # Trigger verification if confidence below threshold
             if conf < self.VERIFY_THRESHOLD:
                 self._verified_tracks[track_id] = now
 
-                # Get person crop for the dialog
                 if track_id not in tracks:
                     continue
                 bbox = tracks[track_id].bbox
                 x1, y1, x2, y2 = bbox
+                bw, bh = x2 - x1, y2 - y1
+                pad_x, pad_y = int(bw * 0.15), int(bh * 0.15)
                 h, w = frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
+                x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+                x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
                 crop = frame[y1:y2, x1:x2].copy()
                 if crop.size == 0:
                     continue
 
                 box_count = result.boxes.get(track_id, 0)
-                self._open_verify_dialog(
-                    track_id, name, conf, crop, box_count)
-                break  # one dialog at a time
+                self._pending_face_verifications.append(PendingFaceVerification(
+                    track_id=track_id,
+                    suggested_name=name,
+                    confidence=conf,
+                    crop=crop,
+                    box_count=box_count,
+                    timestamp=now,
+                ))
 
     def _open_verify_dialog(self, track_id: int, suggested_name: str,
                             confidence: float, crop: np.ndarray,
                             box_count: int):
         """Open a dialog asking user to verify/correct face identity."""
         self._verify_dialog_open = True
+
+        # Log that a verification popup appeared
+        ts = time.strftime("%H:%M:%S")
+        who = suggested_name if suggested_name and suggested_name != "Unknown" else "Unknown"
+        self._append_event_log(
+            f"[{ts}] VERIFY: Asking to identify track {track_id} "
+            f"(suggested: {who}, {confidence:.0%}, {box_count} box(es))")
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Who is this?")
@@ -590,13 +636,21 @@ class InventoryGUI:
         def _confirm():
             name = name_var.get().strip()
             if name:
+                corrected_boxes = box_var.get()
                 self._save_and_train(track_id, name, crop)
                 self._confirmed_tracks.add(track_id)
-                self._save_event_snapshot(name, "detected", box_var.get(), crop)
+                self._save_event_snapshot(name, "detected", corrected_boxes, crop)
+                ts = time.strftime("%H:%M:%S")
+                self._append_event_log(
+                    f"[{ts}] CONFIRMED: Track {track_id} -> {name} "
+                    f"({corrected_boxes} box(es))")
             self._verify_dialog_open = False
             dialog.destroy()
 
         def _skip():
+            ts = time.strftime("%H:%M:%S")
+            self._append_event_log(
+                f"[{ts}] SKIPPED: Track {track_id} verification skipped")
             self._verify_dialog_open = False
             dialog.destroy()
 
@@ -690,6 +744,105 @@ class InventoryGUI:
                                 list(person_dir.glob("*.png")))
                     self.faces_listbox.insert(tk.END, f"{person_dir.name} ({count} imgs)")
 
+    # ================================================================ persistence
+
+    def _load_pending_queue(self):
+        """Load unfinished verifications from disk (survives restart)."""
+        if not self._pending_file.exists():
+            return
+        try:
+            with open(self._pending_file) as f:
+                data = json.load(f)
+            for item in data.get("exit_verifications", []):
+                crop = None
+                crop_path = item.get("crop_path")
+                if crop_path and Path(crop_path).exists():
+                    crop = cv2.imread(crop_path)
+                self._pending_exit_verifications.append(PendingVerification(
+                    track_id=item["track_id"],
+                    identity=item.get("identity"),
+                    identity_confidence=item.get("identity_confidence", 0.0),
+                    box_count=item.get("box_count", 0),
+                    entry_box_count=item.get("entry_box_count", 0),
+                    crop=crop,
+                    timestamp=item.get("timestamp", 0.0),
+                ))
+            for item in data.get("face_verifications", []):
+                crop = None
+                crop_path = item.get("crop_path")
+                if crop_path and Path(crop_path).exists():
+                    crop = cv2.imread(crop_path)
+                if crop is None:
+                    continue  # skip entries without a usable crop
+                self._pending_face_verifications.append(PendingFaceVerification(
+                    track_id=item["track_id"],
+                    suggested_name=item.get("suggested_name", "Unknown"),
+                    confidence=item.get("confidence", 0.0),
+                    crop=crop,
+                    box_count=item.get("box_count", 0),
+                    timestamp=item.get("timestamp", 0.0),
+                ))
+            total = len(self._pending_exit_verifications) + len(self._pending_face_verifications)
+            if total:
+                logger.info(f"Loaded {total} pending verification(s) from previous session")
+        except Exception as e:
+            logger.error(f"Failed to load pending queue: {e}")
+
+    def _save_pending_queue(self):
+        """Save unfinished verifications to disk for next startup."""
+        self._pending_dir.mkdir(parents=True, exist_ok=True)
+        # Clean old crop images
+        for f in self._pending_dir.glob("crop_*.jpg"):
+            f.unlink(missing_ok=True)
+
+        exit_items = []
+        for i, pv in enumerate(self._pending_exit_verifications):
+            crop_path = None
+            if pv.crop is not None and pv.crop.size > 0:
+                crop_path = str(self._pending_dir / f"crop_exit_{i}.jpg")
+                cv2.imwrite(crop_path, pv.crop)
+            exit_items.append({
+                "track_id": pv.track_id,
+                "identity": pv.identity,
+                "identity_confidence": pv.identity_confidence,
+                "box_count": pv.box_count,
+                "entry_box_count": pv.entry_box_count,
+                "crop_path": crop_path,
+                "timestamp": pv.timestamp,
+            })
+
+        face_items = []
+        for i, pf in enumerate(self._pending_face_verifications):
+            crop_path = str(self._pending_dir / f"crop_face_{i}.jpg")
+            cv2.imwrite(crop_path, pf.crop)
+            face_items.append({
+                "track_id": pf.track_id,
+                "suggested_name": pf.suggested_name,
+                "confidence": pf.confidence,
+                "box_count": pf.box_count,
+                "crop_path": crop_path,
+                "timestamp": pf.timestamp,
+            })
+
+        data = {
+            "saved_at": datetime.now().isoformat(),
+            "exit_verifications": exit_items,
+            "face_verifications": face_items,
+        }
+        with open(self._pending_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+        total = len(exit_items) + len(face_items)
+        if total:
+            logger.info(f"Saved {total} pending verification(s) to disk")
+
+    def _clear_pending_file(self):
+        """Remove the pending queue file when all verifications are done."""
+        if self._pending_file.exists():
+            self._pending_file.unlink(missing_ok=True)
+        for f in self._pending_dir.glob("crop_*.jpg"):
+            f.unlink(missing_ok=True)
+
     # ================================================================ run / shutdown
 
     def run(self):
@@ -709,6 +862,15 @@ class InventoryGUI:
         self.root.mainloop()
 
     def _on_close(self):
+        # Save any unfinished verifications so they survive restart
+        with self._exit_verify_lock:
+            has_pending = (self._pending_exit_verifications
+                          or self._pending_face_verifications)
+        if has_pending:
+            self._save_pending_queue()
+        else:
+            self._clear_pending_file()
+
         if self.monitor:
             self.monitor.stop()
             self.monitor = None
