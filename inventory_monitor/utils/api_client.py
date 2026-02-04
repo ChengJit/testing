@@ -1,8 +1,9 @@
 """
 API Client for sending CCTV events to kafka-report service.
 
-This module provides a client for sending entry/exit events and images
-to the ops-portal kafka-report service for centralized logging.
+This module provides a client for sending entry/exit events to the
+ops-portal kafka-report service. Images are uploaded directly to SFTP,
+then only the file path is sent to the API.
 """
 
 import base64
@@ -10,6 +11,7 @@ import json
 import logging
 import threading
 import time
+import os
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +22,25 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# SFTP support
+try:
+    import paramiko
+    SFTP_AVAILABLE = True
+except ImportError:
+    SFTP_AVAILABLE = False
+    logging.warning("paramiko not installed - SFTP uploads disabled. Install with: pip install paramiko")
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SFTPConfig:
+    """SFTP connection configuration."""
+    host: str = "10.0.4.13"
+    port: int = 22
+    username: str = "opsportal"
+    password: str = "l@WmBe@U5@$VFtr3N"
+    remote_base_path: str = "./files/cctv"
 
 
 @dataclass
@@ -35,7 +55,7 @@ class CCTVEvent:
     direction: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
     camera_id: Optional[str] = None
-    image_base64: Optional[str] = None
+    image_path: Optional[str] = None  # Remote SFTP path (not base64)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary, excluding None values."""
@@ -43,16 +63,81 @@ class CCTVEvent:
         return {k: v for k, v in data.items() if v is not None}
 
 
+class SFTPUploader:
+    """Handles SFTP uploads for CCTV images."""
+
+    def __init__(self, config: SFTPConfig):
+        self.config = config
+        self._lock = threading.Lock()
+
+    def upload_image(self, image_bytes: bytes, filename: str) -> Optional[str]:
+        """
+        Upload image to SFTP server.
+
+        Args:
+            image_bytes: Image data as bytes
+            filename: Destination filename
+
+        Returns:
+            Remote file path if successful, None otherwise
+        """
+        if not SFTP_AVAILABLE:
+            logger.error("paramiko not installed - cannot upload to SFTP")
+            return None
+
+        remote_path = f"{self.config.remote_base_path}/{filename}"
+
+        try:
+            with self._lock:
+                transport = paramiko.Transport((self.config.host, self.config.port))
+                transport.connect(username=self.config.username, password=self.config.password)
+                sftp = paramiko.SFTPClient.from_transport(transport)
+
+                try:
+                    # Ensure remote directory exists
+                    remote_dir = os.path.dirname(remote_path)
+                    self._mkdir_p(sftp, remote_dir)
+
+                    # Upload file
+                    with sftp.file(remote_path, 'wb') as f:
+                        f.write(image_bytes)
+
+                    logger.debug(f"Uploaded image to SFTP: {remote_path}")
+                    return remote_path
+
+                finally:
+                    sftp.close()
+                    transport.close()
+
+        except Exception as e:
+            logger.error(f"SFTP upload failed: {e}")
+            return None
+
+    def _mkdir_p(self, sftp, remote_dir: str):
+        """Create remote directory recursively."""
+        if remote_dir == '.' or remote_dir == '':
+            return
+        try:
+            sftp.stat(remote_dir)
+        except FileNotFoundError:
+            parent = os.path.dirname(remote_dir)
+            self._mkdir_p(sftp, parent)
+            try:
+                sftp.mkdir(remote_dir)
+            except IOError:
+                pass  # Directory might already exist
+
+
 class CCTVAPIClient:
     """
     Client for sending CCTV events to the kafka-report API.
 
     Features:
+    - Direct SFTP upload for images (no base64 in API)
     - Automatic retry with exponential backoff
     - Background queue for async sending
     - Batch upload support
     - Connection pooling
-    - SSL verification configurable
     """
 
     def __init__(
@@ -64,13 +149,14 @@ class CCTVAPIClient:
         max_retries: int = 3,
         batch_size: int = 10,
         batch_interval: float = 5.0,
-        async_mode: bool = True
+        async_mode: bool = True,
+        sftp_config: Optional[SFTPConfig] = None
     ):
         """
         Initialize the CCTV API client.
 
         Args:
-            base_url: Base URL of the kafka-report service
+            base_url: Base URL of the kafka-report API
             camera_id: Unique identifier for this camera
             verify_ssl: Whether to verify SSL certificates
             timeout: Request timeout in seconds
@@ -78,6 +164,7 @@ class CCTVAPIClient:
             batch_size: Number of events to batch before sending
             batch_interval: Max seconds to wait before sending partial batch
             async_mode: If True, events are queued and sent in background
+            sftp_config: SFTP configuration for image uploads
         """
         self.base_url = base_url.rstrip('/')
         self.camera_id = camera_id
@@ -86,6 +173,10 @@ class CCTVAPIClient:
         self.batch_size = batch_size
         self.batch_interval = batch_interval
         self.async_mode = async_mode
+
+        # Setup SFTP uploader
+        self.sftp_config = sftp_config or SFTPConfig()
+        self.sftp_uploader = SFTPUploader(self.sftp_config)
 
         # Setup session with retry logic
         self.session = requests.Session()
@@ -230,7 +321,7 @@ class CCTVAPIClient:
             direction: 'entering' or 'exiting'
             track_id: Tracking ID
             details: Additional details dict
-            image: Image bytes (will be base64 encoded)
+            image: Image bytes (will be uploaded to SFTP)
             timestamp: Event timestamp (defaults to now)
 
         Returns:
@@ -238,6 +329,13 @@ class CCTVAPIClient:
         """
         if timestamp is None:
             timestamp = datetime.now()
+
+        # Upload image to SFTP if provided
+        image_path = None
+        if image is not None:
+            safe_identity = (identity or 'unknown').replace(' ', '_').replace('/', '_')
+            filename = f"{self.camera_id}_{timestamp.strftime('%Y%m%d_%H%M%S')}_{safe_identity}.jpg"
+            image_path = self.sftp_uploader.upload_image(image, filename)
 
         event = CCTVEvent(
             timestamp=timestamp.isoformat(),
@@ -249,7 +347,7 @@ class CCTVAPIClient:
             direction=direction,
             details=details,
             camera_id=self.camera_id,
-            image_base64=base64.b64encode(image).decode('utf-8') if image else None
+            image_path=image_path  # Just the path, not base64
         )
 
         event_dict = event.to_dict()
