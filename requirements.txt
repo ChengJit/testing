@@ -14,7 +14,6 @@ onnxruntime>=1.14.0
 
 # API client for remote logging
 requests>=2.28.0
-paramiko>=3.0.0  # SFTP uploads for CCTV images
 
 # PyTorch (CPU version - for GPU, install separately)
 # torch>=2.0.0
