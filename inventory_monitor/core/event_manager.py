@@ -333,6 +333,7 @@ class EventManager:
         camera_id: str = "cam-001",
         verify_ssl: bool = True,
         capture_frame_callback: Optional[Callable[[], Optional[bytes]]] = None,
+        heartbeat_interval: int = 30,
     ) -> "CCTVAPIClient":
         """
         Enable sending events to the remote API.
@@ -342,6 +343,7 @@ class EventManager:
             camera_id: Unique identifier for this camera
             verify_ssl: Whether to verify SSL certificates
             capture_frame_callback: Optional callback to get current frame as JPEG bytes
+            heartbeat_interval: Seconds between heartbeats (default 30)
 
         Returns:
             The initialized CCTVAPIClient instance
@@ -359,6 +361,9 @@ class EventManager:
 
         # Register callback to send events to API
         self.register_callback(self._api_event_callback)
+
+        # Start heartbeat to indicate monitor is online
+        self._api_client.start_heartbeat(interval=heartbeat_interval)
 
         logger.info(f"API reporting enabled: {api_url} (camera: {camera_id})")
         return self._api_client
