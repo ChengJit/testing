@@ -8,10 +8,13 @@ import csv
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, TYPE_CHECKING
 from pathlib import Path
 from enum import Enum
 import threading
+
+if TYPE_CHECKING:
+    from ..utils.api_client import CCTVAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -321,3 +324,80 @@ class EventManager:
 
         logger.info(f"Daily report generated: {report_path}")
         return report
+
+    # ========== API Integration ==========
+
+    def enable_api_reporting(
+        self,
+        api_url: str = "https://ops-portal.fasspay.com/report",
+        camera_id: str = "cam-001",
+        verify_ssl: bool = True,
+        capture_frame_callback: Optional[Callable[[], Optional[bytes]]] = None,
+    ) -> "CCTVAPIClient":
+        """
+        Enable sending events to the remote API.
+
+        Args:
+            api_url: Base URL of the kafka-report API
+            camera_id: Unique identifier for this camera
+            verify_ssl: Whether to verify SSL certificates
+            capture_frame_callback: Optional callback to get current frame as JPEG bytes
+
+        Returns:
+            The initialized CCTVAPIClient instance
+        """
+        from ..utils.api_client import CCTVAPIClient
+
+        self._api_client = CCTVAPIClient(
+            base_url=api_url,
+            camera_id=camera_id,
+            verify_ssl=verify_ssl,
+            async_mode=True,
+        )
+
+        self._capture_frame_callback = capture_frame_callback
+
+        # Register callback to send events to API
+        self.register_callback(self._api_event_callback)
+
+        logger.info(f"API reporting enabled: {api_url} (camera: {camera_id})")
+        return self._api_client
+
+    def _api_event_callback(self, event: InventoryEvent):
+        """Callback to send events to the remote API."""
+        if not hasattr(self, '_api_client') or self._api_client is None:
+            return
+
+        # Get frame image if callback provided
+        image_bytes = None
+        if hasattr(self, '_capture_frame_callback') and self._capture_frame_callback:
+            try:
+                image_bytes = self._capture_frame_callback()
+            except Exception as e:
+                logger.warning(f"Failed to capture frame for API: {e}")
+
+        # Send to API
+        try:
+            self._api_client.send_event(
+                event_type=event.event_type.value,
+                identity=event.identity,
+                identity_confidence=event.identity_confidence,
+                box_count=event.box_count,
+                direction=event.direction,
+                track_id=event.track_id,
+                details=event.details,
+                image=image_bytes,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send event to API: {e}")
+
+    def disable_api_reporting(self):
+        """Disable API reporting and cleanup."""
+        if hasattr(self, '_api_client') and self._api_client:
+            self._api_client.stop()
+            self._api_client = None
+            logger.info("API reporting disabled")
+
+    def get_api_client(self) -> Optional["CCTVAPIClient"]:
+        """Get the current API client instance."""
+        return getattr(self, '_api_client', None)

@@ -43,5 +43,14 @@
     "roi_y2": 1.0,
     "door_line": 0.7,
     "enter_direction_down": false
+  },
+  "api": {
+    "enabled": true,
+    "base_url": "https://ops-portal.fasspay.com/report",
+    "camera_id": "warehouse-cam-001",
+    "verify_ssl": true,
+    "send_images": true,
+    "batch_size": 10,
+    "batch_interval": 5.0
   }
 }

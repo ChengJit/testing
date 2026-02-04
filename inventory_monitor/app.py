@@ -353,6 +353,11 @@ class InventoryMonitor:
             enable_json=True,
         )
 
+        # Initialize API reporting if enabled
+        self._api_client = None
+        if config.api.enabled:
+            self._setup_api_reporting(config)
+
         # Initialize training data collector
         self.training_collector: Optional[TrainingDataCollector] = None
         if config.training.enabled:
@@ -393,6 +398,30 @@ class InventoryMonitor:
         self._correction_input = ""
         self._frame_height = 0
         self._frame_width = 0
+        self._last_frame: Optional[np.ndarray] = None
+
+    def _setup_api_reporting(self, config: Config):
+        """Setup API reporting for remote event logging."""
+        def capture_frame_callback() -> Optional[bytes]:
+            """Callback to capture current frame as JPEG bytes."""
+            if not config.api.send_images:
+                return None
+            if self._last_frame is None:
+                return None
+            try:
+                _, jpeg_buffer = cv2.imencode('.jpg', self._last_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                return jpeg_buffer.tobytes()
+            except Exception as e:
+                logger.warning(f"Failed to encode frame: {e}")
+                return None
+
+        self._api_client = self.event_manager.enable_api_reporting(
+            api_url=config.api.base_url,
+            camera_id=config.api.camera_id,
+            verify_ssl=config.api.verify_ssl,
+            capture_frame_callback=capture_frame_callback,
+        )
+        logger.info(f"API reporting enabled: {config.api.base_url}")
 
     def start(self):
         """Start the monitoring application."""
@@ -431,6 +460,9 @@ class InventoryMonitor:
         # Generate final report
         self.event_manager.generate_daily_report()
 
+        # Stop API reporting
+        self.event_manager.disable_api_reporting()
+
         logger.info("Inventory Monitor stopped")
 
     def process_one_frame(self) -> Optional[np.ndarray]:
@@ -440,6 +472,7 @@ class InventoryMonitor:
             return None
 
         self.frame_count += 1
+        self._last_frame = frame  # Store for API image capture
 
         # Initialize state machine on first frame
         if self.state_machine is None:

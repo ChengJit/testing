@@ -135,6 +135,18 @@ class ReviewConfig:
 
 
 @dataclass
+class APIConfig:
+    """API configuration for remote logging."""
+    enabled: bool = False
+    base_url: str = "https://ops-portal.fasspay.com/report"
+    camera_id: str = "cam-001"
+    verify_ssl: bool = True
+    send_images: bool = True  # Whether to include frame images with events
+    batch_size: int = 10
+    batch_interval: float = 5.0
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     detection: DetectionConfig = field(default_factory=DetectionConfig)
@@ -145,6 +157,7 @@ class Config:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
+    api: APIConfig = field(default_factory=APIConfig)
 
     # Paths
     data_dir: Path = field(default_factory=lambda: Path("data"))
@@ -207,6 +220,11 @@ class Config:
                     if hasattr(config.review, k):
                         setattr(config.review, k, v)
 
+            if "api" in data:
+                for k, v in data["api"].items():
+                    if hasattr(config.api, k):
+                        setattr(config.api, k, v)
+
         return config
 
     def save(self, path: str = "config.json"):
@@ -253,6 +271,15 @@ class Config:
             "review": {
                 "threshold": self.review.threshold,
                 "max_queue_size": self.review.max_queue_size,
+            },
+            "api": {
+                "enabled": self.api.enabled,
+                "base_url": self.api.base_url,
+                "camera_id": self.api.camera_id,
+                "verify_ssl": self.api.verify_ssl,
+                "send_images": self.api.send_images,
+                "batch_size": self.api.batch_size,
+                "batch_interval": self.api.batch_interval,
             }
         }
 
