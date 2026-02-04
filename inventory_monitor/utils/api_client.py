@@ -109,6 +109,10 @@ class CCTVAPIClient:
         self._on_send_success: Optional[Callable] = None
         self._on_send_error: Optional[Callable] = None
 
+        # Heartbeat
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_interval: int = 30
+
         if async_mode:
             self._start_worker()
 
@@ -302,6 +306,38 @@ class CCTVAPIClient:
             **kwargs
         )
 
+    def send_heartbeat(self, status: str = "running") -> bool:
+        """Send heartbeat to indicate this monitor is online."""
+        try:
+            response = self.session.post(
+                f"{self.base_url}/cctv/heartbeat",
+                json={"camera_id": self.camera_id, "status": status},
+                verify=self.verify_ssl,
+                timeout=10
+            )
+            response.raise_for_status()
+            logger.debug(f"Heartbeat sent: {self.camera_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Heartbeat failed: {e}")
+            return False
+
+    def start_heartbeat(self, interval: int = 30):
+        """Start background heartbeat thread."""
+        self._heartbeat_interval = interval
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        logger.info(f"Heartbeat started (every {interval}s)")
+
+    def _heartbeat_loop(self):
+        """Background loop for sending heartbeats."""
+        while not self._stop_event.is_set():
+            self.send_heartbeat("running")
+            # Wait for interval or until stopped
+            self._stop_event.wait(self._heartbeat_interval)
+        # Send final heartbeat indicating shutdown
+        self.send_heartbeat("stopped")
+
     def health_check(self) -> bool:
         """Check if the API is healthy."""
         try:
@@ -331,11 +367,13 @@ class CCTVAPIClient:
             self._last_batch_time = time.time()
 
     def stop(self):
-        """Stop the background worker and send remaining events."""
+        """Stop the background worker, heartbeat, and send remaining events."""
+        self._stop_event.set()
         if self._worker_thread:
-            self._stop_event.set()
             self._worker_thread.join(timeout=10)
-            logger.info("CCTV API client stopped")
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=5)
+        logger.info("CCTV API client stopped")
 
     def __enter__(self):
         return self
