@@ -57,7 +57,7 @@ class CCTVAPIClient:
 
     def __init__(
         self,
-        base_url: str = "https://ops-portal.fasspay.com/report",
+        base_url: str = "https://ops-portal.fasspay.com/cctv",
         camera_id: str = "cam-001",
         verify_ssl: bool = True,
         timeout: int = 30,
@@ -164,7 +164,7 @@ class CCTVAPIClient:
 
         try:
             response = self.session.post(
-                f"{self.base_url}/cctv/events/batch",
+                f"{self.base_url}/events/batch",
                 json={"events": events},
                 verify=self.verify_ssl,
                 timeout=self.timeout
@@ -190,7 +190,7 @@ class CCTVAPIClient:
         """Send a single event to the API."""
         try:
             response = self.session.post(
-                f"{self.base_url}/cctv/event",
+                f"{self.base_url}/event",
                 json=event_dict,
                 verify=self.verify_ssl,
                 timeout=self.timeout
@@ -310,7 +310,7 @@ class CCTVAPIClient:
         """Send heartbeat to indicate this monitor is online."""
         try:
             response = self.session.post(
-                f"{self.base_url}/cctv/heartbeat",
+                f"{self.base_url}/heartbeat",
                 json={"camera_id": self.camera_id, "status": status},
                 verify=self.verify_ssl,
                 timeout=10
@@ -342,7 +342,7 @@ class CCTVAPIClient:
         """Check if the API is healthy."""
         try:
             response = self.session.get(
-                f"{self.base_url}/cctv/health",
+                f"{self.base_url}/health",
                 verify=self.verify_ssl,
                 timeout=10
             )

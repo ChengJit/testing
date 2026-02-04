@@ -329,7 +329,7 @@ class EventManager:
 
     def enable_api_reporting(
         self,
-        api_url: str = "https://ops-portal.fasspay.com/report",
+        api_url: str = "https://ops-portal.fasspay.com/cctv",
         camera_id: str = "cam-001",
         verify_ssl: bool = True,
         capture_frame_callback: Optional[Callable[[], Optional[bytes]]] = None,
