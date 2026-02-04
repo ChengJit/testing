@@ -138,7 +138,7 @@ class ReviewConfig:
 class APIConfig:
     """API configuration for remote logging."""
     enabled: bool = False
-    base_url: str = "https://ops-portal.fasspay.com/cctv"
+    base_url: str = "https://ops-portal.fasspay.com/report/cctv"
     camera_id: str = "cam-001"
     verify_ssl: bool = True
     send_images: bool = True  # Whether to include frame images with events

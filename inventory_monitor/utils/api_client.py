@@ -57,7 +57,7 @@ class CCTVAPIClient:
 
     def __init__(
         self,
-        base_url: str = "https://ops-portal.fasspay.com/cctv",
+        base_url: str = "https://ops-portal.fasspay.com/report/cctv",
         camera_id: str = "cam-001",
         verify_ssl: bool = True,
         timeout: int = 30,
