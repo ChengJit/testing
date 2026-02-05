@@ -1,0 +1,1094 @@
+"""
+Main Inventory Door Monitor Application.
+Ties together all components for a complete monitoring solution.
+"""
+
+import json
+import logging
+import time
+import threading
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from queue import Queue, Empty
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from .config import Config
+from .detectors import PersonDetector, FaceRecognizer, BoxDetector
+from .detectors.box import TrainingDataCollector, BoxDetection
+from .trackers import ByteTracker, TrackedObject
+from .core import EventManager, EventType, PersonStateMachine, PersonContext
+from .utils import JetsonOptimizer, VideoCapture
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BoxInfo:
+    """Information about a detected box."""
+    bbox: Tuple[int, int, int, int]
+    confidence: float
+    class_name: str
+    method: str  # detection method used
+
+
+@dataclass
+class ProcessingResult:
+    """Result from AI processing pipeline."""
+    frame_id: int
+    persons: List[Tuple[Tuple[int, int, int, int], float]]  # (bbox, conf)
+    faces: Dict[int, Tuple[str, float]]  # track_id -> (name, confidence)
+    boxes: Dict[int, int]  # track_id -> box_count
+    box_detections: Dict[int, List[BoxInfo]]  # track_id -> list of box info
+    all_boxes: List[BoxInfo]  # all detected boxes for visualization
+    processing_time_ms: float
+
+
+class AIWorker:
+    """
+    Background AI processing worker.
+    Runs detection and recognition in a separate thread.
+    """
+
+    def __init__(
+        self,
+        person_detector: PersonDetector,
+        face_recognizer: FaceRecognizer,
+        box_detector: BoxDetector,
+        process_fps: int = 15,
+        training_collector: Optional[TrainingDataCollector] = None,
+        ai_scale: float = 1.0,
+        priority_recognition: bool = True,
+    ):
+        self.person_detector = person_detector
+        self.face_recognizer = face_recognizer
+        self.box_detector = box_detector
+        self.process_interval = 1.0 / process_fps
+        self.training_collector = training_collector
+        self.ai_scale = max(0.1, min(1.0, ai_scale))
+        self.priority_recognition = priority_recognition
+        self.door_y: Optional[int] = None
+        self.enter_direction_down: bool = False
+
+        self._input_queue: Queue = Queue(maxsize=2)
+        self._output_queue: Queue = Queue(maxsize=2)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._frame_count = 0
+
+    def start(self):
+        """Start the AI worker thread."""
+        if self._running:
+            return
+
+        self._running = True
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+        logger.info("AI worker started")
+
+    def stop(self):
+        """Stop the AI worker thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        logger.info("AI worker stopped")
+
+    def submit(self, frame: np.ndarray, tracks: Dict[int, TrackedObject]) -> bool:
+        """
+        Submit frame for processing.
+
+        Returns True if submitted, False if queue full.
+        """
+        try:
+            # Clear old items
+            while not self._input_queue.empty():
+                try:
+                    self._input_queue.get_nowait()
+                except Empty:
+                    break
+
+            self._frame_count += 1
+            self._input_queue.put_nowait((frame.copy(), tracks.copy(), self._frame_count))
+            return True
+        except Exception:
+            return False
+
+    def get_result(self, timeout: float = 0.1) -> Optional[ProcessingResult]:
+        """Get processing result if available."""
+        try:
+            return self._output_queue.get(timeout=timeout)
+        except Empty:
+            return None
+
+    def _worker_loop(self):
+        """Main worker loop."""
+        while self._running:
+            try:
+                frame, tracks, frame_id = self._input_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            start_time = time.time()
+
+            try:
+                result = self._process_frame(frame, tracks, frame_id)
+
+                # Put result, dropping old ones
+                while not self._output_queue.empty():
+                    try:
+                        self._output_queue.get_nowait()
+                    except Empty:
+                        break
+
+                self._output_queue.put_nowait(result)
+
+            except Exception as e:
+                logger.error(f"AI processing error: {e}")
+
+            # Maintain target FPS
+            elapsed = time.time() - start_time
+            sleep_time = self.process_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _compute_priority(self, track: TrackedObject) -> float:
+        """Compute recognition priority score for a track.
+
+        Higher score = should be processed first (closer to door, approaching).
+        """
+        if self.door_y is None:
+            return 0.0
+
+        distance = abs(track.center[1] - self.door_y)
+        base = 1.0 / max(1, distance)
+
+        # Determine if approaching door based on velocity
+        approaching = False
+        positions = list(track.position_history)
+        if len(positions) >= 2:
+            dy = positions[-1][1] - positions[-2][1]
+            if self.enter_direction_down:
+                approaching = dy > 0  # Moving down toward door
+            else:
+                approaching = dy < 0  # Moving up toward door
+
+        return base * (2.0 if approaching else 1.0)
+
+    def _process_frame(
+        self,
+        frame: np.ndarray,
+        tracks: Dict[int, TrackedObject],
+        frame_id: int
+    ) -> ProcessingResult:
+        """Process single frame through AI pipeline.
+
+        If ai_scale < 1.0, the frame is downscaled before AI processing and
+        all resulting bounding boxes are scaled back to original resolution.
+        """
+        start_time = time.time()
+
+        # --- Downscale for AI if configured ---
+        scale = self.ai_scale
+        need_scale = scale < 1.0
+        if need_scale:
+            oh, ow = frame.shape[:2]
+            nh, nw = int(oh * scale), int(ow * scale)
+            small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            inv = 1.0 / scale  # multiplier to map back
+
+            # Scale existing track bboxes into small-frame coords
+            small_tracks = {}
+            for tid, track in tracks.items():
+                # Create a lightweight copy-like object with scaled bbox
+                small_tracks[tid] = track
+                # We'll use scaled bbox only for per-track operations below
+        else:
+            small = frame
+            inv = 1.0
+            small_tracks = tracks
+
+        def _scale_bbox(bbox):
+            """Scale bbox from small frame back to original resolution."""
+            if not need_scale:
+                return bbox
+            x1, y1, x2, y2 = bbox
+            return (int(x1 * inv), int(y1 * inv),
+                    int(x2 * inv), int(y2 * inv))
+
+        def _down_bbox(bbox):
+            """Scale bbox from original resolution to small frame."""
+            if not need_scale:
+                return bbox
+            x1, y1, x2, y2 = bbox
+            return (int(x1 * scale), int(y1 * scale),
+                    int(x2 * scale), int(y2 * scale))
+
+        # 1. Detect persons (on small frame)
+        person_detections = self.person_detector.detect(small)
+        # Scale bboxes back to original resolution
+        persons = [(_scale_bbox(d.bbox), d.confidence) for d in person_detections]
+
+        # 2. Face recognition for each tracked person (priority-ordered)
+        faces = {}
+
+        # Sort tracks by door-proximity priority if enabled
+        if self.priority_recognition and self.door_y is not None:
+            sorted_track_items = sorted(
+                tracks.items(),
+                key=lambda item: self._compute_priority(item[1]),
+                reverse=True,
+            )
+        else:
+            sorted_track_items = list(tracks.items())
+
+        face_start_time = time.time()
+        for track_id, track in sorted_track_items:
+            if track.identity_locked:
+                faces[track_id] = (track.identity, track.identity_confidence)
+                continue
+
+            # Time-budget check: skip remaining low-priority tracks if over budget
+            if self.priority_recognition and len(sorted_track_items) > 1:
+                elapsed_face = time.time() - face_start_time
+                if elapsed_face > self.process_interval * 0.8:
+                    logger.debug(
+                        f"Face recognition time budget exceeded, "
+                        f"skipping track {track_id}"
+                    )
+                    continue
+
+            # Use small frame + scaled-down bbox for face recognition
+            face_match = self.face_recognizer.recognize(
+                small,
+                person_bbox=_down_bbox(track.bbox),
+                track_id=track_id
+            )
+
+            if face_match and face_match.name != "Unknown":
+                faces[track_id] = (face_match.name, face_match.confidence)
+
+        # 3. Box detection on small frame
+        small_person_bboxes = [_down_bbox(t.bbox) for t in tracks.values()]
+        all_box_detections = self.box_detector.detect(
+            small, small_person_bboxes or None)
+
+        # 4. Assign boxes to persons (in small-frame coords)
+        small_person_map = {tid: _down_bbox(t.bbox) for tid, t in tracks.items()}
+        assigned = self.box_detector.assign_boxes_to_persons(
+            all_box_detections, small_person_map)
+
+        boxes = {}
+        box_detections = {}
+        all_boxes = []
+
+        for track_id, track in tracks.items():
+            carried = assigned.get(track_id, [])
+            boxes[track_id] = len(carried)
+
+            track_box_info = []
+            for box in carried:
+                box_info = BoxInfo(
+                    bbox=_scale_bbox(box.bbox),
+                    confidence=box.confidence,
+                    class_name=box.class_name,
+                    method=box.detection_method
+                )
+                track_box_info.append(box_info)
+                all_boxes.append(box_info)
+
+            box_detections[track_id] = track_box_info
+
+            # Enqueue to training data collector (use original frame)
+            if self.training_collector:
+                self.training_collector.enqueue(
+                    frame=frame,
+                    person_bbox=track.bbox,
+                    box_detections=carried,
+                    track_id=track_id,
+                    identity=tracks[track_id].identity,
+                )
+
+            if carried:
+                identity = tracks[track_id].identity or f"Track_{track_id}"
+                logger.debug(
+                    f"[BOX] {identity} carrying {len(carried)} box(es): "
+                    f"{[f'{b.class_name}({b.confidence:.0%})' for b in carried]}"
+                )
+
+        processing_time = (time.time() - start_time) * 1000
+
+        return ProcessingResult(
+            frame_id=frame_id,
+            persons=persons,
+            faces=faces,
+            boxes=boxes,
+            box_detections=box_detections,
+            all_boxes=all_boxes,
+            processing_time_ms=processing_time
+        )
+
+
+class InventoryMonitor:
+    """
+    Main inventory monitoring application.
+
+    Orchestrates video capture, AI processing, tracking,
+    and event management.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.running = False
+
+        # Initialize Jetson optimizer
+        self.optimizer = JetsonOptimizer()
+        self.optimizer.optimize_for_inference()
+
+        # Get optimal settings
+        optimal = self.optimizer.get_optimal_settings()
+        logger.info(f"Using optimal settings: {optimal}")
+
+        # Initialize video capture
+        self.video = VideoCapture(
+            source=config.camera.source,
+            width=config.camera.width,
+            height=config.camera.height,
+            fps=config.camera.fps,
+            buffer_size=config.camera.buffer_size,
+            capture_width=config.camera.capture_width,
+            capture_height=config.camera.capture_height,
+        )
+
+        # Initialize detectors
+        self.person_detector = PersonDetector(
+            model_path=config.detection.yolo_model,
+            imgsz=optimal["imgsz"],
+            conf_threshold=config.detection.yolo_conf,
+            use_tensorrt=config.jetson.use_tensorrt,
+            fp16=config.jetson.fp16_inference,
+        )
+
+        self.face_recognizer = FaceRecognizer(
+            model_name=config.detection.face_model,
+            det_size=config.detection.face_det_size,
+            recognition_threshold=config.detection.face_recognition_threshold,
+            lock_threshold=config.detection.face_lock_threshold,
+            faces_dir=str(config.faces_dir),
+        )
+
+        self.box_detector = BoxDetector(
+            custom_model_path=config.detection.box_model,
+            conf_threshold=config.detection.box_conf,
+            min_area=config.detection.box_min_area,
+            max_area=config.detection.box_max_area,
+            imgsz=optimal["imgsz"],
+        )
+
+        # Initialize tracker
+        self.tracker = ByteTracker(
+            track_thresh=config.tracking.track_thresh,
+            track_buffer=config.tracking.track_buffer,
+            match_thresh=config.tracking.match_thresh,
+        )
+
+        # Initialize state machine (will be set after first frame)
+        self.state_machine: Optional[PersonStateMachine] = None
+        self.event_manager = EventManager(
+            log_dir=str(config.log_dir),
+            enable_csv=True,
+            enable_json=True,
+        )
+
+        # Initialize API reporting if enabled
+        self._api_client = None
+        if config.api.enabled:
+            self._setup_api_reporting(config)
+
+        # Initialize training data collector
+        self.training_collector: Optional[TrainingDataCollector] = None
+        if config.training.enabled:
+            self.training_collector = TrainingDataCollector(
+                output_dir=config.training.output_dir,
+                capture_interval=config.training.capture_interval,
+                max_samples=config.training.max_samples,
+                save_full_frame=config.training.save_full_frame,
+                negative_ratio=config.training.negative_ratio,
+                auto_verify_threshold=config.training.auto_verify_threshold,
+                retrain_min_samples=config.training.retrain_min_samples,
+            )
+
+        # Initialize AI worker
+        self.ai_worker = AIWorker(
+            person_detector=self.person_detector,
+            face_recognizer=self.face_recognizer,
+            box_detector=self.box_detector,
+            process_fps=optimal["process_fps"],
+            training_collector=self.training_collector,
+            ai_scale=config.jetson.ai_scale,
+            priority_recognition=config.detection.priority_recognition,
+        )
+
+        # Stats
+        self.frame_count = 0
+        self.last_ai_result: Optional[ProcessingResult] = None
+        self.start_time = 0.0
+
+        # Display settings
+        self.show_zones = config.display.show_zones
+        self.show_stats = config.display.show_stats
+        self.show_boxes = config.display.show_boxes
+        self.display_width = config.display.width
+        self.display_height = config.display.height
+
+        # GUI face correction state
+        self._correction_mode = False
+        self._correction_track_ids: List[int] = []
+        self._correction_index = 0
+        self._correction_input = ""
+        self._frame_height = 0
+        self._frame_width = 0
+        self._last_frame: Optional[np.ndarray] = None
+
+        # Auto-registration notification flag
+        self._faces_ready_to_register: List[int] = []
+
+    def _setup_api_reporting(self, config: Config):
+        """Setup API reporting for remote event logging."""
+        def capture_frame_callback() -> Optional[bytes]:
+            """Callback to capture current frame as JPEG bytes."""
+            if not config.api.send_images:
+                return None
+            if self._last_frame is None:
+                return None
+            try:
+                _, jpeg_buffer = cv2.imencode('.jpg', self._last_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                return jpeg_buffer.tobytes()
+            except Exception as e:
+                logger.warning(f"Failed to encode frame: {e}")
+                return None
+
+        self._api_client = self.event_manager.enable_api_reporting(
+            api_url=config.api.base_url,
+            camera_id=config.api.camera_id,
+            verify_ssl=config.api.verify_ssl,
+            capture_frame_callback=capture_frame_callback,
+        )
+        logger.info(f"API reporting enabled: {config.api.base_url}")
+
+    def start(self):
+        """Start the monitoring application."""
+        logger.info("Starting Inventory Monitor...")
+
+        # Start video capture
+        if not self.video.start():
+            logger.error("Failed to start video capture")
+            return False
+
+        # Warmup detectors
+        logger.info("Warming up AI models...")
+        self.person_detector.warmup()
+
+        # Start AI worker
+        self.ai_worker.start()
+
+        # Start training data collector
+        if self.training_collector:
+            self.training_collector.start()
+
+        self.running = True
+        self.start_time = time.time()
+
+        logger.info("Inventory Monitor started successfully")
+        return True
+
+    def stop(self):
+        """Stop the monitoring application."""
+        self.running = False
+        if self.training_collector:
+            self.training_collector.stop()
+        self.ai_worker.stop()
+        self.video.stop()
+
+        # Generate final report
+        self.event_manager.generate_daily_report()
+
+        # Stop API reporting
+        self.event_manager.disable_api_reporting()
+
+        logger.info("Inventory Monitor stopped")
+
+    def process_one_frame(self) -> Optional[np.ndarray]:
+        """Process one frame through the pipeline. Returns raw frame or None."""
+        ret, frame = self.video.read(timeout=0.01)
+        if not ret or frame is None:
+            return None
+
+        self.frame_count += 1
+        self._last_frame = frame  # Store for API image capture
+
+        # Initialize state machine on first frame
+        if self.state_machine is None:
+            h, w = frame.shape[:2]
+            self._init_managers(h, w)
+
+        # Submit to AI worker
+        tracks = self.tracker.get_confirmed_tracks()
+        self.ai_worker.submit(frame, tracks)
+
+        # Get AI result
+        result = self.ai_worker.get_result(timeout=0.001)
+        if result:
+            self.last_ai_result = result
+            self._process_ai_result(result)
+
+        # Update tracker with latest detections
+        if self.last_ai_result:
+            self.tracker.update(self.last_ai_result.persons)
+
+        # Memory cleanup periodically
+        if self.frame_count % self.config.jetson.clear_cache_interval == 0:
+            self.optimizer.clear_gpu_memory()
+
+        # Deferred event cleanup every 30 frames
+        if self.frame_count % 30 == 0:
+            self.event_manager.cleanup_deferred_events(
+                self.config.detection.identity_resolve_timeout
+            )
+
+        # Check for retrain completion every 60 frames
+        if self.frame_count % 60 == 0 and self.training_collector:
+            new_model = self.training_collector.check_retrain_complete()
+            if new_model:
+                self.box_detector.reload_model(new_model)
+
+        return frame
+
+    def run(self):
+        """Main application loop."""
+        if not self.start():
+            return
+
+        try:
+            while self.running:
+                # Read frame
+                ret, frame = self.video.read(timeout=1.0)
+
+                if not ret or frame is None:
+                    continue
+
+                self.frame_count += 1
+
+                # Initialize state machine on first frame
+                if self.state_machine is None:
+                    h, w = frame.shape[:2]
+                    self._frame_height = h
+                    self._frame_width = w
+                    self._init_managers(h, w)
+
+                # Submit to AI worker
+                tracks = self.tracker.get_confirmed_tracks()
+                self.ai_worker.submit(frame, tracks)
+
+                # Get AI result
+                result = self.ai_worker.get_result(timeout=0.01)
+                if result:
+                    self.last_ai_result = result
+                    self._process_ai_result(result)
+
+                # Update tracker with latest detections
+                if self.last_ai_result:
+                    self.tracker.update(self.last_ai_result.persons)
+
+                # Draw and display
+                if not self.config.headless:
+                    display_frame = self._draw_overlay(frame)
+
+                    # Resize to display dimensions
+                    display_frame = cv2.resize(
+                        display_frame,
+                        (self.display_width, self.display_height),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+
+                    cv2.imshow("Inventory Monitor", display_frame)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    self._handle_key(key)
+
+                # Memory cleanup periodically
+                if self.frame_count % self.config.jetson.clear_cache_interval == 0:
+                    self.optimizer.clear_gpu_memory()
+
+                # Deferred event cleanup every 30 frames
+                if self.frame_count % 30 == 0:
+                    self.event_manager.cleanup_deferred_events(
+                        self.config.detection.identity_resolve_timeout
+                    )
+
+                # Check for retrain completion every 60 frames
+                if self.frame_count % 60 == 0 and self.training_collector:
+                    new_model = self.training_collector.check_retrain_complete()
+                    if new_model:
+                        self.box_detector.reload_model(new_model)
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        finally:
+            self.stop()
+            cv2.destroyAllWindows()
+
+    def _handle_key(self, key: int):
+        """Handle keyboard input for GUI controls."""
+        if self._correction_mode:
+            self._handle_correction_key(key)
+            return
+
+        if key == ord('q'):
+            self.running = False
+        elif key == ord('z'):
+            self.show_zones = not self.show_zones
+        elif key == ord('s'):
+            self.show_stats = not self.show_stats
+        elif key == ord('b'):
+            self.show_boxes = not self.show_boxes
+        elif key == ord('r'):
+            self._handle_registration()
+        elif key == ord('t'):
+            logger.info("Retraining faces from images...")
+            count = self.face_recognizer.retrain_all()
+            logger.info(f"Retrained {count} faces")
+        elif key == ord('c'):
+            self._enter_correction_mode()
+        elif key == ord('m'):
+            # Trigger box model retraining
+            if self.training_collector:
+                started = self.training_collector.trigger_retrain(
+                    model_output_dir=str(self.config.models_dir)
+                )
+                if started:
+                    logger.info("Box model retraining triggered via 'M' key")
+                else:
+                    verified = self.training_collector.count_verified_samples()
+                    logger.info(
+                        f"Retraining not started: {verified} verified samples "
+                        f"(need {self.config.training.retrain_min_samples})"
+                    )
+            else:
+                logger.info("Training collector not active, cannot retrain")
+        elif key == ord('d'):
+            # Toggle training data collection
+            if self.training_collector:
+                self.training_collector.stop()
+                self.training_collector = None
+                self.ai_worker.training_collector = None
+                logger.info("Training data collection DISABLED")
+            else:
+                self.training_collector = TrainingDataCollector(
+                    output_dir=self.config.training.output_dir,
+                    capture_interval=self.config.training.capture_interval,
+                    max_samples=self.config.training.max_samples,
+                    save_full_frame=self.config.training.save_full_frame,
+                    negative_ratio=self.config.training.negative_ratio,
+                    auto_verify_threshold=self.config.training.auto_verify_threshold,
+                    retrain_min_samples=self.config.training.retrain_min_samples,
+                )
+                self.training_collector.start()
+                self.ai_worker.training_collector = self.training_collector
+                logger.info("Training data collection ENABLED")
+
+    def _init_managers(self, height: int, width: int):
+        """Initialize state machine for door crossing detection."""
+        door_y = int(self.config.zone.door_line * height)
+
+        self.state_machine = PersonStateMachine(
+            door_y=door_y,
+            enter_direction_down=self.config.zone.enter_direction_down,
+        )
+
+        # Update AIWorker with door position for priority recognition
+        self.ai_worker.door_y = door_y
+        self.ai_worker.enter_direction_down = self.config.zone.enter_direction_down
+
+        logger.info(f"State machine initialized for {width}x{height} frame, door_y={door_y}")
+
+    def _process_ai_result(self, result: ProcessingResult):
+        """Process AI result and update state."""
+        tracks = self.tracker.get_confirmed_tracks()
+
+        for track_id, track in tracks.items():
+            # Update identity
+            if track_id in result.faces:
+                name, conf = result.faces[track_id]
+                track.set_identity(name, conf)
+
+                # Check for deferred events that can now be resolved
+                deferred = self.event_manager._deferred_events.get(track_id)
+                if deferred and not deferred.resolved and name and name != "Unknown":
+                    self.event_manager.record_identity_resolved(
+                        track_id=track_id,
+                        identity=name,
+                        identity_confidence=conf,
+                        camera_id=self.config.api.camera_id,
+                    )
+
+            # Update box count
+            if track_id in result.boxes:
+                track.update_box_count(result.boxes[track_id])
+
+            # Update state machine
+            if self.state_machine:
+                event = self.state_machine.update(
+                    track_id=track_id,
+                    center=track.center,
+                    box_count=track.box_count,
+                    identity=track.identity,
+                    identity_confidence=track.identity_confidence,
+                )
+
+                # Record events
+                if event == "entered":
+                    ctx = self.state_machine.get_context(track_id)
+                    self.event_manager.record_entry(
+                        track_id=track_id,
+                        identity=track.identity,
+                        identity_confidence=track.identity_confidence,
+                        box_count=ctx.entry_box_count if ctx else track.box_count,
+                    )
+                elif event == "exited":
+                    ctx = self.state_machine.get_context(track_id)
+                    self.event_manager.record_exit(
+                        track_id=track_id,
+                        identity=track.identity,
+                        identity_confidence=track.identity_confidence,
+                        box_count=ctx.exit_box_count if ctx else track.box_count,
+                        entry_box_count=ctx.entry_box_count if ctx else 0,
+                    )
+
+        # Auto-registration for unrecognized faces
+        self._faces_ready_to_register = []
+        for track_id, track in tracks.items():
+            if track.identity_locked or (track.identity and track.identity != "Unknown"):
+                continue
+            if self.face_recognizer.get_registration_ready(track_id):
+                if self.config.detection.auto_register:
+                    label = self.face_recognizer.auto_register(
+                        track_id,
+                        pattern=self.config.detection.auto_register_pattern,
+                    )
+                    if label:
+                        track.set_identity(label, 1.0, lock=True)
+                        # Send FACE_AUTO_REGISTERED event
+                        unknown_data = self.face_recognizer.unknown_faces.get(track_id)
+                        sample_count = unknown_data.collection_count if unknown_data else 0
+                        self.event_manager.record_event(
+                            event_type=EventType.FACE_AUTO_REGISTERED,
+                            track_id=track_id,
+                            identity=label,
+                            identity_confidence=0.0,
+                            details={
+                                "sample_count": sample_count,
+                                "auto_generated": True,
+                            },
+                        )
+                else:
+                    self._faces_ready_to_register.append(track_id)
+
+    # ---- GUI Face Correction ----
+
+    def _enter_correction_mode(self):
+        """Enter face correction mode. Selects tracked persons to correct."""
+        tracks = self.tracker.get_confirmed_tracks()
+        if not tracks:
+            logger.info("No tracked persons to correct")
+            return
+        self._correction_track_ids = list(tracks.keys())
+        self._correction_index = 0
+        self._correction_input = ""
+        self._correction_mode = True
+        logger.info(f"Correction mode: {len(self._correction_track_ids)} persons. "
+                     "Tab=next, type name + Enter to assign, Esc to cancel")
+
+    def _handle_correction_key(self, key: int):
+        """Handle keyboard input while in correction mode."""
+        if key == 27:  # Esc
+            self._correction_mode = False
+            self._correction_input = ""
+            logger.info("Correction mode cancelled")
+        elif key == 9:  # Tab - cycle to next track
+            self._correction_index = (self._correction_index + 1) % len(self._correction_track_ids)
+            self._correction_input = ""
+        elif key == 13:  # Enter - commit correction
+            if self._correction_input.strip():
+                self._apply_correction(self._correction_input.strip())
+            self._correction_input = ""
+        elif key == 8:  # Backspace
+            self._correction_input = self._correction_input[:-1]
+        elif 32 <= key < 127:  # Printable ASCII
+            self._correction_input += chr(key)
+
+    def _apply_correction(self, name: str):
+        """Apply a face identity correction: save images and update identity."""
+        if not self._correction_track_ids:
+            return
+
+        track_id = self._correction_track_ids[self._correction_index]
+        tracks = self.tracker.get_confirmed_tracks()
+        track = tracks.get(track_id)
+
+        if track is None:
+            logger.warning(f"Track {track_id} no longer active")
+            return
+
+        # Try to save face images from unknown face collection
+        saved = False
+        if self.face_recognizer.get_registration_ready(track_id):
+            saved = self.face_recognizer.register_face(track_id, name)
+        else:
+            # Save any collected images even if not enough for full registration
+            unknown_data = self.face_recognizer.unknown_faces.get(track_id)
+            if unknown_data and unknown_data.images:
+                person_dir = Path(self.config.faces_dir) / name
+                person_dir.mkdir(parents=True, exist_ok=True)
+                for i, img in enumerate(unknown_data.images):
+                    img_path = person_dir / f"{name}_{int(time.time())}_{i}.jpg"
+                    cv2.imwrite(str(img_path), img)
+                saved = True
+                logger.info(f"Saved {len(unknown_data.images)} images for {name}")
+
+        # Update track identity
+        track.set_identity(name, 1.0, lock=True)
+
+        if saved:
+            # Auto-retrain embeddings after correction
+            logger.info(f"Corrected track {track_id} -> {name}, retraining embeddings...")
+            self.face_recognizer.retrain_all()
+        else:
+            logger.info(f"Corrected track {track_id} -> {name} (no face images saved)")
+
+        # Update auto_registrations.jsonl if this was an auto-registered face
+        auto_reg_path = self.face_recognizer._auto_registrations_path
+        if auto_reg_path.exists():
+            try:
+                from datetime import datetime as dt
+                correction_record = {
+                    "track_id": track_id,
+                    "corrected_label": name,
+                    "corrected_time": dt.now().isoformat(),
+                    "reviewed": True,
+                }
+                with open(auto_reg_path, "a") as f:
+                    f.write(json.dumps(correction_record) + "\n")
+            except Exception as e:
+                logger.warning(f"Failed to log correction to auto_registrations: {e}")
+
+        self._correction_mode = False
+
+    # ---- Drawing ----
+
+    def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """Draw visualization overlay on frame."""
+        display = frame.copy()
+        h, w = display.shape[:2]
+
+        # Draw door line and zones
+        if self.show_zones and self.state_machine:
+            door_y = self.state_machine.door_y
+            threshold = self.state_machine.door_threshold
+
+            # Door line
+            cv2.line(display, (0, door_y), (w, door_y), (0, 255, 255), 2)
+            cv2.putText(display, "DOOR LINE", (10, door_y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            # Door threshold zones
+            cv2.rectangle(display,
+                          (0, door_y - threshold),
+                          (w, door_y),
+                          (0, 255, 0), 1)
+            cv2.rectangle(display,
+                          (0, door_y),
+                          (w, door_y + threshold),
+                          (0, 0, 255), 1)
+
+        # Draw detected boxes
+        if self.show_boxes and self.last_ai_result:
+            for box_info in self.last_ai_result.all_boxes:
+                bx1, by1, bx2, by2 = box_info.bbox
+                box_color = (255, 255, 0)  # Cyan
+                cv2.rectangle(display, (bx1, by1), (bx2, by2), box_color, 2)
+                box_label = f"{box_info.class_name} {box_info.confidence:.0%}"
+                cv2.putText(display, box_label, (bx1, by1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                method_short = box_info.method[:3].upper()
+                cv2.putText(display, method_short, (bx2 - 30, by2 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1)
+
+        # Draw tracked persons
+        tracks = self.tracker.get_confirmed_tracks()
+        for track_id, track in tracks.items():
+            x1, y1, x2, y2 = track.bbox
+
+            # Color based on identity status
+            if track.identity_locked:
+                color = (0, 255, 0)  # Green - identified
+            elif track.identity:
+                color = (0, 255, 255)  # Yellow - tentative
+            else:
+                color = (0, 165, 255)  # Orange - unknown
+
+            # Highlight selected track in correction mode
+            if self._correction_mode and self._correction_track_ids:
+                selected_tid = self._correction_track_ids[self._correction_index]
+                if track_id == selected_tid:
+                    color = (255, 0, 255)  # Magenta for selected
+                    cv2.rectangle(display, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), color, 3)
+
+            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+
+            # Label
+            name = track.identity or f"ID:{track_id}"
+            conf_str = f"{track.identity_confidence:.0%}" if track.identity else ""
+            box_str = f" [{track.box_count} box]" if track.box_count > 0 else ""
+            label = f"{name} {conf_str}{box_str}".strip()
+
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(display, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+            cv2.putText(display, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # Carrying indicator
+            if track.box_count > 0:
+                cv2.putText(display, "CARRYING", (x1, y2 + 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Direction arrow
+            direction = track.get_direction()
+            if direction:
+                # get_direction() assumes down=entering; flip label
+                # if config says entering is moving up
+                enter_down = self.config.zone.enter_direction_down
+                if not enter_down:
+                    # Invert the label: tracker said "entering" (moving down)
+                    # but config says moving down = exiting
+                    if direction == "entering":
+                        direction = "exiting"
+                    else:
+                        direction = "entering"
+
+                cx, cy = track.center
+                arrow_color = (0, 255, 0) if direction == "entering" else (0, 0, 255)
+                # Arrow points in actual movement direction (from position history)
+                y_positions = [p[1] for p in list(track.position_history)[-5:]]
+                moving_down = (y_positions[-1] - y_positions[0]) > 0 if len(y_positions) >= 2 else True
+                dy = 40 if moving_down else -40
+                cv2.arrowedLine(display, (cx, cy), (cx, cy + dy), arrow_color, 3)
+                dir_label = "ENTERING" if direction == "entering" else "EXITING"
+                cv2.putText(display, dir_label, (cx - 40, cy + dy + (20 if dy > 0 else -10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, arrow_color, 2)
+
+        # Draw stats panel
+        if self.show_stats:
+            stats = self.event_manager.get_statistics()
+            elapsed = time.time() - self.start_time
+            fps = self.frame_count / elapsed if elapsed > 0 else 0
+
+            overlay = display.copy()
+            cv2.rectangle(overlay, (5, 5), (250, 160), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
+
+            stats_text = [
+                f"FPS: {fps:.1f}",
+                f"AI: {self.last_ai_result.processing_time_ms:.0f}ms" if self.last_ai_result else "AI: --",
+                f"Entries: {stats['total_entries']} | Exits: {stats['total_exits']}",
+                f"Boxes In: {stats['boxes_brought_in']}",
+                f"Boxes Out: {stats['boxes_taken_out']}",
+                f"People Inside: {stats['persons_currently_inside']}",
+            ]
+
+            y = 25
+            for text in stats_text:
+                cv2.putText(display, text, (15, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                y += 22
+
+        # Auto-registration notification
+        if self._faces_ready_to_register:
+            notify_text = f"New face ready ({len(self._faces_ready_to_register)}) - press R to register"
+            (tw, th), _ = cv2.getTextSize(notify_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            nx = w - tw - 15
+            ny = 30
+            overlay_bg = display.copy()
+            cv2.rectangle(overlay_bg, (nx - 5, ny - th - 5), (nx + tw + 5, ny + 5), (0, 120, 0), -1)
+            cv2.addWeighted(overlay_bg, 0.7, display, 0.3, 0, display)
+            cv2.putText(display, notify_text, (nx, ny),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Correction mode overlay
+        if self._correction_mode and self._correction_track_ids:
+            self._draw_correction_panel(display)
+
+        # Instructions bar at bottom
+        data_status = "ON" if self.training_collector else "OFF"
+        if self._correction_mode:
+            instructions = "CORRECTION MODE: Tab=next person | Type name + Enter | Esc=cancel"
+        else:
+            retrain_str = " | M:Retrain Box" if self.training_collector else ""
+            instructions = f"Q:Quit | Z:Zones | S:Stats | B:Boxes | R:Register | T:Retrain | C:Correct | D:Data({data_status}){retrain_str}"
+        cv2.rectangle(display, (0, h - 25), (w, h), (50, 50, 50), -1)
+        cv2.putText(display, instructions, (10, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        return display
+
+    def _draw_correction_panel(self, display: np.ndarray):
+        """Draw the face correction panel overlay."""
+        h, w = display.shape[:2]
+        panel_w, panel_h = 350, 100
+        px = w - panel_w - 10
+        py = 10
+
+        # Semi-transparent background
+        overlay = display.copy()
+        cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (80, 0, 80), -1)
+        cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
+
+        track_id = self._correction_track_ids[self._correction_index]
+        tracks = self.tracker.get_confirmed_tracks()
+        track = tracks.get(track_id)
+
+        current_name = "N/A"
+        if track:
+            current_name = track.identity or f"Unknown (ID:{track_id})"
+
+        lines = [
+            f"CORRECT IDENTITY ({self._correction_index + 1}/{len(self._correction_track_ids)})",
+            f"Current: {current_name}",
+            f"New name: {self._correction_input}_",
+        ]
+
+        y = py + 25
+        for line in lines:
+            cv2.putText(display, line, (px + 10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y += 25
+
+    def _handle_registration(self):
+        """Handle face registration for unknown persons."""
+        tracks = self.tracker.get_confirmed_tracks()
+
+        for track_id, track in tracks.items():
+            if track.identity_locked:
+                continue
+
+            if self.face_recognizer.get_registration_ready(track_id):
+                name = input(f"Enter name for Track {track_id} (or skip): ").strip()
+
+                if name:
+                    success = self.face_recognizer.register_face(track_id, name)
+                    if success:
+                        track.set_identity(name, 1.0, lock=True)
+                        logger.info(f"Registered: {name}")
