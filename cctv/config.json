@@ -30,7 +30,7 @@
     "ai_scale": 0.5
   },
   "camera": {
-    "source": "rtsp://fasspay:fasspay2025@192.168.122.127:554/stream1",
+    "source": "rtsp://fasspay:fasspay2025@192.168.122.127:554/stream1?rtsp_transport=tcp",
     "width": 1920,
     "height": 1080,
     "capture_width": 960,
@@ -57,9 +57,9 @@
     "max_queue_size": 50
   },
   "api": {
-    "enabled": false,
+    "enabled": true,
     "base_url": "https://ops-portal.fasspay.com/report/cctv",
-    "camera_id": "cam-001",
+    "camera_id": "warehouse-cam-001",
     "verify_ssl": true,
     "send_images": true,
     "batch_size": 10,
