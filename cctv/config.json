@@ -6,8 +6,15 @@
     "box_model": null,
     "box_conf": 0.4,
     "face_model": "buffalo_s",
-    "face_det_size": [320, 320],
-    "face_recognition_threshold": 0.45
+    "face_det_size": [
+      320,
+      320
+    ],
+    "face_recognition_threshold": 0.45,
+    "auto_register": false,
+    "auto_register_pattern": "Person_{}",
+    "priority_recognition": true,
+    "identity_resolve_timeout": 30.0
   },
   "tracking": {
     "track_thresh": 0.5,
@@ -29,25 +36,30 @@
     "capture_width": 960,
     "capture_height": 540
   },
-  "display": {
-    "width": 1920,
-    "height": 1080,
-    "show_zones": true,
-    "show_stats": true,
-    "show_boxes": true
-  },
   "zone": {
     "roi_x1": 0.0,
     "roi_y1": 0.0,
     "roi_x2": 1.0,
     "roi_y2": 1.0,
-    "door_line": 0.7,
+    "door_line": 0.5,
     "enter_direction_down": false
   },
+  "training": {
+    "enabled": false,
+    "output_dir": "training_queue",
+    "capture_interval": 30,
+    "max_samples": 5000,
+    "auto_verify_threshold": 0.8,
+    "retrain_min_samples": 500
+  },
+  "review": {
+    "threshold": 0.6,
+    "max_queue_size": 50
+  },
   "api": {
-    "enabled": true,
-    "base_url": "https://ops-portal.fasspay.com/report",
-    "camera_id": "warehouse-cam-001",
+    "enabled": false,
+    "base_url": "https://ops-portal.fasspay.com/report/cctv",
+    "camera_id": "cam-001",
     "verify_ssl": true,
     "send_images": true,
     "batch_size": 10,
