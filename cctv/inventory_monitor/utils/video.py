@@ -201,9 +201,16 @@ class VideoCapture:
         else:
             scale_cap = ""
 
+        # Extract base URL (remove query params for GStreamer)
+        rtsp_url = self.source.split("?")[0]
+
+        # Check if TCP transport is requested via URL param
+        use_tcp = "rtsp_transport=tcp" in self.source
+        protocols = "protocols=tcp" if use_tcp else ""
+
         # GStreamer pipeline optimized for Jetson/RTSP
         pipeline = (
-            f"rtspsrc location={self.source} latency=0 ! "
+            f"rtspsrc location={rtsp_url} {protocols} latency=0 ! "
             f"rtph264depay ! h264parse ! "
             f"nvv4l2decoder ! "
             f"nvvidconv ! "

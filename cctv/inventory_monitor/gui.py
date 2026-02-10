@@ -315,7 +315,12 @@ class InventoryGUI:
     # ================================================================ frame loop
 
     def _update_frame(self):
-        if not self.monitor or not self.monitor.running:
+        if not self.monitor:
+            return
+
+        # Keep trying even if monitor.running is False (reconnecting)
+        if not self.monitor.running:
+            self.root.after(500, self._update_frame)  # Retry slower while reconnecting
             return
 
         try:
