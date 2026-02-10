@@ -133,9 +133,9 @@ class AIWorker:
             return
 
         self._running = True
-        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="AIWorker")
         self._thread.start()
-        logger.info("AI worker started")
+        logger.info(f"[AI_WORKER] Started - body_reid_enabled={self.body_reid_enabled}, body_recognizer={'available' if self.body_recognizer else 'None'}")
 
     def stop(self):
         """Stop the AI worker thread."""
@@ -327,6 +327,7 @@ class AIWorker:
                 # Extract body crop from original frame (not scaled)
                 body_crop = extract_body_crop(frame, track.bbox)
                 if body_crop is not None:
+                    logger.debug(f"[AI_WORKER] Attempting body recognition for track {track_id}, crop shape={body_crop.shape}")
                     body_result = self.body_recognizer.recognize(body_crop)
                     if body_result.name is not None:
                         bodies[track_id] = (
@@ -334,8 +335,8 @@ class AIWorker:
                             body_result.confidence,
                             "body"
                         )
-                        logger.debug(
-                            f"Body match for track {track_id}: "
+                        logger.info(
+                            f"[AI_WORKER] Body match for track {track_id}: "
                             f"{body_result.name} ({body_result.confidence:.2f})"
                         )
                     elif body_result.confidence > 0:
@@ -347,11 +348,17 @@ class AIWorker:
                                 closest.confidence,
                                 "closest"
                             )
-                            logger.debug(
-                                f"Closest body match for track {track_id}: "
+                            logger.info(
+                                f"[AI_WORKER] Closest body match for track {track_id}: "
                                 f"{closest.name} ({closest.confidence:.2f}, "
                                 f"review={closest.needs_review})"
                             )
+                        else:
+                            logger.debug(f"[AI_WORKER] No body match for track {track_id}, best_score={closest.confidence:.2f}")
+                    else:
+                        logger.debug(f"[AI_WORKER] Body recognition returned no match for track {track_id}")
+                else:
+                    logger.debug(f"[AI_WORKER] Failed to extract body crop for track {track_id}")
 
         # 3. Box detection on small frame
         small_person_bboxes = [_down_bbox(t.bbox) for t in tracks.values()]
@@ -622,9 +629,22 @@ class InventoryMonitor:
         # Start recognition worker for async identity resolution
         if self.recognition_worker:
             self.recognition_worker.start()
+            logger.info("[MONITOR] Recognition worker started")
+        else:
+            logger.info("[MONITOR] Recognition worker NOT started (body_reid disabled or not configured)")
 
         self.running = True
         self.start_time = time.time()
+
+        # Log threading summary
+        logger.info("=" * 60)
+        logger.info("[MONITOR] THREADING SUMMARY:")
+        logger.info(f"  - AI Worker: RUNNING")
+        logger.info(f"  - Recognition Worker: {'RUNNING' if self.recognition_worker else 'DISABLED'}")
+        logger.info(f"  - Capture Worker: {'PENDING (init on first frame)' if self.recognition_queue else 'DISABLED'}")
+        logger.info(f"  - Body ReID: {'ENABLED' if self.body_recognizer else 'DISABLED'}")
+        logger.info(f"  - Training Collector: {'RUNNING' if self.training_collector else 'DISABLED'}")
+        logger.info("=" * 60)
 
         logger.info("Inventory Monitor started successfully")
         return True
@@ -860,13 +880,21 @@ class InventoryMonitor:
                 enter_direction_down=self.config.zone.enter_direction_down,
                 crossing_threshold=self.state_machine.door_threshold,
             )
-            logger.info("Capture worker initialized")
+            logger.info(f"[CAPTURE_WORKER] Initialized - door_y={door_y}, enter_down={self.config.zone.enter_direction_down}, threshold={self.state_machine.door_threshold}")
 
         logger.info(f"State machine initialized for {width}x{height} frame, door_y={door_y}")
 
     def _process_ai_result(self, result: ProcessingResult):
         """Process AI result and update state."""
         tracks = self.tracker.get_confirmed_tracks()
+
+        # Log periodic status
+        if self.frame_count % 150 == 0:
+            logger.debug(
+                f"[MONITOR] Frame #{self.frame_count}: "
+                f"tracks={len(tracks)}, faces={len(result.faces)}, bodies={len(result.bodies)}, "
+                f"ai_time={result.processing_time_ms:.1f}ms"
+            )
 
         for track_id, track in tracks.items():
             # Update identity from face recognition (highest priority)

@@ -166,9 +166,9 @@ class RecognitionWorker:
             return
 
         self._running = True
-        self._thread = threading.Thread(target=self._process_loop, daemon=True)
+        self._thread = threading.Thread(target=self._process_loop, daemon=True, name="RecognitionWorker")
         self._thread.start()
-        logger.info("Recognition worker started")
+        logger.info(f"[RECOGNITION_WORKER] Started - face_thresh={self.face_threshold}, body_thresh={self.body_threshold}, closest_thresh={self.closest_threshold}")
 
     def stop(self):
         """Stop the recognition worker thread."""
@@ -184,17 +184,30 @@ class RecognitionWorker:
 
     def _process_loop(self):
         """Main processing loop."""
+        logger.info("[RECOGNITION_WORKER] Processing loop started")
+        loop_count = 0
         while self._running:
+            loop_count += 1
+            queue_size = self.queue.size()
+
+            if loop_count % 100 == 0:
+                logger.debug(f"[RECOGNITION_WORKER] Loop #{loop_count}, queue_size={queue_size}, stats={self.stats}")
+
             event = self.queue.get(timeout=0.5)
             if event is None:
                 continue
 
+            logger.info(f"[RECOGNITION_WORKER] Processing event: track_id={event.track_id}, type={event.event_type}, face_detected={event.face_detected}")
+
             try:
                 result = self._process_event(event)
+                logger.info(f"[RECOGNITION_WORKER] Result: identity={result.identity}, method={result.match_method}, confidence={result.confidence:.2f}")
                 if result.identity:
                     self._send_identity_resolved(event, result)
             except Exception as e:
-                logger.error(f"Recognition processing error: {e}")
+                logger.error(f"[RECOGNITION_WORKER] Processing error: {e}", exc_info=True)
+
+        logger.info("[RECOGNITION_WORKER] Processing loop ended")
 
     def _process_event(self, event: CaptureEvent) -> RecognitionResult:
         """

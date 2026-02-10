@@ -100,8 +100,10 @@ class BodyRecognizer:
             self._load_osnet_model()
 
         logger.info(
-            f"BodyRecognizer initialized: {len(self.known_names)} known persons, "
-            f"OSNet={'available' if self._osnet_available else 'unavailable'}"
+            f"[BODY_RECOGNIZER] Initialized: {len(self.known_names)} known persons, "
+            f"OSNet={'available' if self._osnet_available else 'unavailable'}, "
+            f"histogram={'enabled' if self.use_histogram else 'disabled'}, "
+            f"threshold={self.threshold}, closest_threshold={self.closest_threshold}"
         )
 
     def _load_embeddings(self):

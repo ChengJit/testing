@@ -86,6 +86,13 @@ class CaptureWorker:
         """
         with self._frame_lock:
             self._current_frame = frame.copy()
+            # Log occasionally to show it's receiving frames
+            if hasattr(self, '_frame_count'):
+                self._frame_count += 1
+            else:
+                self._frame_count = 1
+            if self._frame_count % 300 == 1:
+                logger.debug(f"[CAPTURE_WORKER] Frame #{self._frame_count} received, shape={frame.shape}")
 
     def process_track(
         self,
@@ -124,6 +131,7 @@ class CaptureWorker:
             crossing_event = "exited" if self.enter_direction_down else "entered"
 
         if crossing_event:
+            logger.info(f"[CAPTURE_WORKER] Door crossing detected! track_id={track_id}, event={crossing_event}, prev_zone={prev_zone}, current_zone={current_zone}")
             self._on_door_crossing(
                 track_id=track_id,
                 track=track,
@@ -131,6 +139,8 @@ class CaptureWorker:
                 face_crop=face_crop,
                 face_detected=face_detected,
             )
+        elif prev_zone != current_zone:
+            logger.debug(f"[CAPTURE_WORKER] Track {track_id} zone change: {prev_zone} -> {current_zone} (y={center_y}, door_y={self.door_y})")
 
         return crossing_event
 
@@ -193,9 +203,10 @@ class CaptureWorker:
         # Queue for recognition
         if self.recognition_queue.put(capture_event):
             self.stats["captures_queued"] += 1
-            logger.debug(
-                f"Queued capture for track {track_id}: {event_type}, "
-                f"face_detected={face_detected}"
+            queue_size = self.recognition_queue.size()
+            logger.info(
+                f"[CAPTURE_WORKER] Queued capture for track {track_id}: {event_type}, "
+                f"face_detected={face_detected}, queue_size={queue_size}"
             )
 
         # Update stats

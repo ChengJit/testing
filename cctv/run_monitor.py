@@ -201,10 +201,19 @@ if __name__ == "__main__":
     elif args.train:
         train_faces()
     elif args.gui:
+        # Setup logging for GUI mode
+        log_level = logging.DEBUG if args.debug else logging.INFO
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S"
+        )
         from inventory_monitor.gui import InventoryGUI
         config = Config.load(args.config)
         if args.source:
             config.camera.source = args.source
+        if args.debug:
+            config.debug = True
         gui = InventoryGUI(config)
         gui.run()
     else:
