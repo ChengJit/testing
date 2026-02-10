@@ -13,6 +13,8 @@ from pathlib import Path
 from enum import Enum
 import threading
 
+import numpy as np
+
 if TYPE_CHECKING:
     from ..utils.api_client import CCTVAPIClient
 
@@ -41,6 +43,33 @@ class DeferredEvent:
     identity_confidence: float = 0.0
     resolved: bool = False
     resolved_timestamp: Optional[str] = None
+
+
+@dataclass
+class CaptureEvent:
+    """Queued item for the recognition thread to process."""
+    track_id: int
+    timestamp: str
+    event_type: str  # "entry" or "exit"
+    full_body_crop: "np.ndarray"  # Full body image from YOLO bbox
+    face_crop: Optional["np.ndarray"] = None  # Face ROI if detected
+    face_detected: bool = False
+    box_count: int = 0
+    processing_status: str = "pending"  # "pending", "processing", "resolved"
+    door_crossing_logged: bool = False
+
+
+@dataclass
+class RecognitionResult:
+    """Output from the recognition thread."""
+    track_id: int
+    identity: Optional[str] = None
+    confidence: float = 0.0
+    match_method: str = "none"  # "face", "body", "closest", "none"
+    face_score: Optional[float] = None
+    body_score: Optional[float] = None
+    needs_review: bool = False
+    alternative_matches: Optional[List[tuple]] = None  # List of (name, score) tuples
 
 
 @dataclass
@@ -243,8 +272,16 @@ class EventManager:
         identity: Optional[str] = None,
         identity_confidence: float = 0.0,
         box_count: int = 0,
+        match_method: str = "none",
+        body_score: Optional[float] = None,
     ) -> InventoryEvent:
         """Convenience method for recording person entry."""
+        details = {}
+        if match_method != "none":
+            details["match_method"] = match_method
+        if body_score is not None:
+            details["body_score"] = body_score
+
         event = self.record_event(
             event_type=EventType.PERSON_ENTERED,
             track_id=track_id,
@@ -252,6 +289,7 @@ class EventManager:
             identity_confidence=identity_confidence,
             box_count=box_count,
             direction="entering",
+            details=details if details else None,
         )
 
         # Create deferred event if identity is unknown
@@ -278,6 +316,8 @@ class EventManager:
         identity_confidence: float = 0.0,
         box_count: int = 0,
         entry_box_count: int = 0,
+        match_method: str = "none",
+        body_score: Optional[float] = None,
     ) -> InventoryEvent:
         """Convenience method for recording person exit."""
         box_diff = box_count - entry_box_count
@@ -286,6 +326,12 @@ class EventManager:
             "exit_box_count": box_count,
             "box_difference": box_diff,
         }
+
+        # Add match method and body score if available
+        if match_method != "none":
+            details["match_method"] = match_method
+        if body_score is not None:
+            details["body_score"] = body_score
 
         # Alert if taking more boxes than brought in
         if box_diff > 0:

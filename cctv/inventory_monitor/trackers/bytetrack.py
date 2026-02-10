@@ -35,6 +35,8 @@ class TrackedObject:
     identity: Optional[str] = None
     identity_confidence: float = 0.0
     identity_locked: bool = False
+    match_method: str = "none"  # "face", "body", "closest", "none"
+    body_score: Optional[float] = None  # Body recognition score if used
 
     # Tracking state
     hits: int = 1

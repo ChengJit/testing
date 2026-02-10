@@ -17,10 +17,13 @@ import cv2
 import numpy as np
 
 from .config import Config
-from .detectors import PersonDetector, FaceRecognizer, BoxDetector
+from .detectors import PersonDetector, FaceRecognizer, BoxDetector, BodyRecognizer
 from .detectors.box import TrainingDataCollector, BoxDetection
 from .trackers import ByteTracker, TrackedObject
-from .core import EventManager, EventType, PersonStateMachine, PersonContext
+from .core import (
+    EventManager, EventType, PersonStateMachine, PersonContext,
+    RecognitionQueue, RecognitionWorker, CaptureWorker
+)
 from .utils import JetsonOptimizer, VideoCapture
 
 logger = logging.getLogger(__name__)
@@ -41,10 +44,51 @@ class ProcessingResult:
     frame_id: int
     persons: List[Tuple[Tuple[int, int, int, int], float]]  # (bbox, conf)
     faces: Dict[int, Tuple[str, float]]  # track_id -> (name, confidence)
+    bodies: Dict[int, Tuple[Optional[str], float, str]]  # track_id -> (name, score, method)
     boxes: Dict[int, int]  # track_id -> box_count
     box_detections: Dict[int, List[BoxInfo]]  # track_id -> list of box info
     all_boxes: List[BoxInfo]  # all detected boxes for visualization
     processing_time_ms: float
+
+
+def extract_body_crop(
+    frame: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    padding: float = 0.05
+) -> Optional[np.ndarray]:
+    """
+    Extract body crop from frame using YOLO person bbox.
+
+    Args:
+        frame: Full BGR frame
+        bbox: Person bounding box (x1, y1, x2, y2)
+        padding: Optional padding as fraction of bbox size
+
+    Returns:
+        BGR image of body region, or None if invalid
+    """
+    if frame is None or frame.size == 0:
+        return None
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+
+    # Add padding
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_x = int(bw * padding)
+    pad_y = int(bh * padding)
+
+    # Clamp to frame bounds
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(w, x2 + pad_x)
+    y2 = min(h, y2 + pad_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return frame[y1:y2, x1:x2].copy()
 
 
 class AIWorker:
@@ -58,18 +102,22 @@ class AIWorker:
         person_detector: PersonDetector,
         face_recognizer: FaceRecognizer,
         box_detector: BoxDetector,
+        body_recognizer: Optional[BodyRecognizer] = None,
         process_fps: int = 15,
         training_collector: Optional[TrainingDataCollector] = None,
         ai_scale: float = 1.0,
         priority_recognition: bool = True,
+        body_reid_enabled: bool = True,
     ):
         self.person_detector = person_detector
         self.face_recognizer = face_recognizer
         self.box_detector = box_detector
+        self.body_recognizer = body_recognizer
         self.process_interval = 1.0 / process_fps
         self.training_collector = training_collector
         self.ai_scale = max(0.1, min(1.0, ai_scale))
         self.priority_recognition = priority_recognition
+        self.body_reid_enabled = body_reid_enabled
         self.door_y: Optional[int] = None
         self.enter_direction_down: bool = False
 
@@ -234,6 +282,7 @@ class AIWorker:
 
         # 2. Face recognition for each tracked person (priority-ordered)
         faces = {}
+        bodies = {}  # track_id -> (name, score, method)
 
         # Sort tracks by door-proximity priority if enabled
         if self.priority_recognition and self.door_y is not None:
@@ -268,8 +317,41 @@ class AIWorker:
                 track_id=track_id
             )
 
+            face_recognized = False
             if face_match and face_match.name != "Unknown":
                 faces[track_id] = (face_match.name, face_match.confidence)
+                face_recognized = True
+
+            # Body recognition fallback when face not recognized
+            if not face_recognized and self.body_reid_enabled and self.body_recognizer:
+                # Extract body crop from original frame (not scaled)
+                body_crop = extract_body_crop(frame, track.bbox)
+                if body_crop is not None:
+                    body_result = self.body_recognizer.recognize(body_crop)
+                    if body_result.name is not None:
+                        bodies[track_id] = (
+                            body_result.name,
+                            body_result.confidence,
+                            "body"
+                        )
+                        logger.debug(
+                            f"Body match for track {track_id}: "
+                            f"{body_result.name} ({body_result.confidence:.2f})"
+                        )
+                    elif body_result.confidence > 0:
+                        # Try closest match fallback
+                        closest = self.body_recognizer.find_closest(body_crop)
+                        if closest.name is not None:
+                            bodies[track_id] = (
+                                closest.name,
+                                closest.confidence,
+                                "closest"
+                            )
+                            logger.debug(
+                                f"Closest body match for track {track_id}: "
+                                f"{closest.name} ({closest.confidence:.2f}, "
+                                f"review={closest.needs_review})"
+                            )
 
         # 3. Box detection on small frame
         small_person_bboxes = [_down_bbox(t.bbox) for t in tracks.values()]
@@ -325,6 +407,7 @@ class AIWorker:
             frame_id=frame_id,
             persons=persons,
             faces=faces,
+            bodies=bodies,
             boxes=boxes,
             box_detections=box_detections,
             all_boxes=all_boxes,
@@ -388,6 +471,22 @@ class InventoryMonitor:
             imgsz=optimal["imgsz"],
         )
 
+        # Initialize body recognizer if enabled
+        self.body_recognizer: Optional[BodyRecognizer] = None
+        if config.body_reid.enabled:
+            self.body_recognizer = BodyRecognizer(
+                embeddings_file=config.body_embeddings_file,
+                profiles_file=config.person_profiles_file,
+                body_model_path=config.body_reid.body_model_path,
+                use_osnet=True,
+                use_histogram=config.body_reid.use_color_histogram,
+                histogram_weight=config.body_reid.histogram_weight,
+                threshold=config.body_reid.body_threshold,
+                closest_threshold=config.body_reid.closest_match_threshold,
+                margin_threshold=config.body_reid.margin_threshold,
+            )
+            logger.info("Body recognizer initialized")
+
         # Initialize tracker
         self.tracker = ByteTracker(
             track_thresh=config.tracking.track_thresh,
@@ -426,11 +525,32 @@ class InventoryMonitor:
             person_detector=self.person_detector,
             face_recognizer=self.face_recognizer,
             box_detector=self.box_detector,
+            body_recognizer=self.body_recognizer,
             process_fps=optimal["process_fps"],
             training_collector=self.training_collector,
             ai_scale=config.jetson.ai_scale,
             priority_recognition=config.detection.priority_recognition,
+            body_reid_enabled=config.body_reid.enabled,
         )
+
+        # Initialize recognition queue and worker for async identity resolution
+        self.recognition_queue: Optional[RecognitionQueue] = None
+        self.recognition_worker: Optional[RecognitionWorker] = None
+        self.capture_worker: Optional[CaptureWorker] = None
+
+        if config.body_reid.enabled:
+            self.recognition_queue = RecognitionQueue(max_size=20)
+            self.recognition_worker = RecognitionWorker(
+                face_recognizer=self.face_recognizer,
+                body_recognizer=self.body_recognizer,
+                event_manager=self.event_manager,
+                queue=self.recognition_queue,
+                camera_id=config.api.camera_id,
+                face_threshold=config.detection.face_recognition_threshold,
+                body_threshold=config.body_reid.body_threshold,
+                closest_threshold=config.body_reid.closest_match_threshold,
+            )
+            logger.info("Recognition worker initialized")
 
         # Stats
         self.frame_count = 0
@@ -499,6 +619,10 @@ class InventoryMonitor:
         if self.training_collector:
             self.training_collector.start()
 
+        # Start recognition worker for async identity resolution
+        if self.recognition_worker:
+            self.recognition_worker.start()
+
         self.running = True
         self.start_time = time.time()
 
@@ -508,6 +632,11 @@ class InventoryMonitor:
     def stop(self):
         """Stop the monitoring application."""
         self.running = False
+
+        # Stop recognition worker first
+        if self.recognition_worker:
+            self.recognition_worker.stop()
+
         if self.training_collector:
             self.training_collector.stop()
         self.ai_worker.stop()
@@ -529,6 +658,10 @@ class InventoryMonitor:
 
         self.frame_count += 1
         self._last_frame = frame  # Store for API image capture
+
+        # Update capture worker's frame reference
+        if self.capture_worker:
+            self.capture_worker.update_frame(frame)
 
         # Initialize state machine on first frame
         if self.state_machine is None:
@@ -581,6 +714,11 @@ class InventoryMonitor:
                     continue
 
                 self.frame_count += 1
+                self._last_frame = frame  # Store for API image capture
+
+                # Update capture worker's frame reference
+                if self.capture_worker:
+                    self.capture_worker.update_frame(frame)
 
                 # Initialize state machine on first frame
                 if self.state_machine is None:
@@ -713,6 +851,17 @@ class InventoryMonitor:
         self.ai_worker.door_y = door_y
         self.ai_worker.enter_direction_down = self.config.zone.enter_direction_down
 
+        # Initialize capture worker if recognition queue exists
+        if self.recognition_queue:
+            self.capture_worker = CaptureWorker(
+                event_manager=self.event_manager,
+                recognition_queue=self.recognition_queue,
+                door_y=door_y,
+                enter_direction_down=self.config.zone.enter_direction_down,
+                crossing_threshold=self.state_machine.door_threshold,
+            )
+            logger.info("Capture worker initialized")
+
         logger.info(f"State machine initialized for {width}x{height} frame, door_y={door_y}")
 
     def _process_ai_result(self, result: ProcessingResult):
@@ -720,10 +869,11 @@ class InventoryMonitor:
         tracks = self.tracker.get_confirmed_tracks()
 
         for track_id, track in tracks.items():
-            # Update identity
+            # Update identity from face recognition (highest priority)
             if track_id in result.faces:
                 name, conf = result.faces[track_id]
                 track.set_identity(name, conf)
+                track.match_method = "face"
 
                 # Check for deferred events that can now be resolved
                 deferred = self.event_manager._deferred_events.get(track_id)
@@ -734,6 +884,25 @@ class InventoryMonitor:
                         identity_confidence=conf,
                         camera_id=self.config.api.camera_id,
                     )
+
+            # Update identity from body recognition (fallback)
+            elif track_id in result.bodies and not track.identity_locked:
+                name, score, method = result.bodies[track_id]
+                # Only update if we don't already have a face-based identity
+                if not track.identity or track.identity == "Unknown":
+                    track.set_identity(name, score)
+                    track.match_method = method  # "body" or "closest"
+                    track.body_score = score
+
+                    # Check for deferred events that can now be resolved
+                    deferred = self.event_manager._deferred_events.get(track_id)
+                    if deferred and not deferred.resolved and name and name != "Unknown":
+                        self.event_manager.record_identity_resolved(
+                            track_id=track_id,
+                            identity=name,
+                            identity_confidence=score,
+                            camera_id=self.config.api.camera_id,
+                        )
 
             # Update box count
             if track_id in result.boxes:
@@ -757,6 +926,8 @@ class InventoryMonitor:
                         identity=track.identity,
                         identity_confidence=track.identity_confidence,
                         box_count=ctx.entry_box_count if ctx else track.box_count,
+                        match_method=track.match_method,
+                        body_score=track.body_score,
                     )
                 elif event == "exited":
                     ctx = self.state_machine.get_context(track_id)
@@ -766,6 +937,8 @@ class InventoryMonitor:
                         identity_confidence=track.identity_confidence,
                         box_count=ctx.exit_box_count if ctx else track.box_count,
                         entry_box_count=ctx.entry_box_count if ctx else 0,
+                        match_method=track.match_method,
+                        body_score=track.body_score,
                     )
 
         # Auto-registration for unrecognized faces

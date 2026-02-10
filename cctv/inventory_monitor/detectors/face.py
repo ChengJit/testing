@@ -394,6 +394,69 @@ class FaceRecognizer:
             logger.error(f"Face recognition error: {e}")
             return None
 
+    def recognize_crop(
+        self,
+        face_crop: np.ndarray,
+        track_id: Optional[int] = None
+    ) -> Optional[FaceMatch]:
+        """
+        Recognize face from a pre-cropped face/body image.
+
+        Args:
+            face_crop: Cropped BGR image containing face
+            track_id: Optional track ID for unknown face collection
+
+        Returns:
+            FaceMatch if face found, None otherwise
+        """
+        if self.app is None or face_crop is None:
+            return None
+
+        try:
+            faces = self.app.get(face_crop)
+
+            if not faces:
+                return None
+
+            # Get largest face
+            face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            embedding = face.normed_embedding
+
+            if embedding is None:
+                return None
+
+            fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+            face_bbox = (fx1, fy1, fx2, fy2)
+
+            # Match against known faces
+            if self.known_embeddings is not None and len(self.known_names) > 0:
+                similarities = np.dot(self.known_embeddings, embedding)
+                best_idx = np.argmax(similarities)
+                best_score = similarities[best_idx]
+
+                if best_score >= self.recognition_threshold:
+                    return FaceMatch(
+                        name=self.known_names[best_idx],
+                        confidence=float(best_score),
+                        bbox=face_bbox,
+                        embedding=embedding
+                    )
+
+            # Unknown face - collect for potential registration
+            if track_id is not None:
+                self._collect_unknown_face(track_id, embedding, face_crop)
+
+            return FaceMatch(
+                name="Unknown",
+                confidence=0.0,
+                bbox=face_bbox,
+                embedding=embedding
+            )
+
+        except Exception as e:
+            logger.debug(f"Face crop recognition error: {e}")
+            return None
+
     def _collect_unknown_face(
         self,
         track_id: int,

@@ -147,6 +147,20 @@ class ReviewConfig:
 
 
 @dataclass
+class BodyReIDConfig:
+    """Body re-identification configuration."""
+    enabled: bool = True  # Enable body-based recognition
+    body_model: str = "osnet_x0_25"  # OSNet variant to use
+    body_model_path: Optional[str] = None  # Path to model file (None = auto-download)
+    body_threshold: float = 0.6  # Minimum confidence for body match
+    use_color_histogram: bool = True  # Also use color histogram matching
+    histogram_weight: float = 0.5  # Weight for histogram (vs 0.5 for OSNet)
+    face_body_weight: Tuple[float, float] = (0.7, 0.3)  # Weights for score fusion
+    closest_match_threshold: float = 0.5  # Threshold for closest match fallback
+    margin_threshold: float = 0.1  # Flag for review if top-2 margin < this
+
+
+@dataclass
 class APIConfig:
     """API configuration for remote logging."""
     enabled: bool = False
@@ -170,12 +184,15 @@ class Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    body_reid: BodyReIDConfig = field(default_factory=BodyReIDConfig)
 
     # Paths
     data_dir: Path = field(default_factory=lambda: Path("data"))
     log_dir: Path = field(default_factory=lambda: Path("logs"))
     models_dir: Path = field(default_factory=lambda: Path("models"))
     faces_dir: Path = field(default_factory=lambda: Path("known_faces"))
+    body_embeddings_file: Path = field(default_factory=lambda: Path("data/body_embeddings.npz"))
+    person_profiles_file: Path = field(default_factory=lambda: Path("data/person_profiles.json"))
 
     # Runtime
     headless: bool = False
@@ -236,6 +253,14 @@ class Config:
                 for k, v in data["api"].items():
                     if hasattr(config.api, k):
                         setattr(config.api, k, v)
+
+            if "body_reid" in data:
+                for k, v in data["body_reid"].items():
+                    if hasattr(config.body_reid, k):
+                        if k == "face_body_weight" and isinstance(v, list):
+                            setattr(config.body_reid, k, tuple(v))
+                        else:
+                            setattr(config.body_reid, k, v)
 
         return config
 
