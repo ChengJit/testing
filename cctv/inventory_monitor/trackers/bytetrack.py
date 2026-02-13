@@ -381,7 +381,12 @@ class ByteTracker:
                 to_remove.append(track_id)
 
         for track_id in to_remove:
-            logger.debug(f"Removed track {track_id}")
+            track = self.tracks[track_id]
+            logger.info(
+                f"[TRACKER] Removing track {track_id}: state={track.state.name}, "
+                f"identity={track.identity or 'Unknown'}, age={track.age}, "
+                f"time_since_update={track.time_since_update}, center={track.center}"
+            )
             del self.tracks[track_id]
 
     def _get_active_tracks(self) -> Dict[int, TrackedObject]:

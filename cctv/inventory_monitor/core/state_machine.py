@@ -236,6 +236,9 @@ class PersonStateMachine:
         elif ctx.state == PersonState.INSIDE:
             if at_door and direction == "exiting":
                 ctx.transition_to(PersonState.EXITING)
+                logger.info(f"[STATE] Track {ctx.track_id} starting to EXIT (at_door={at_door}, direction={direction})")
+            elif at_door:
+                logger.debug(f"[STATE] Track {ctx.track_id} at door but direction={direction} (need 'exiting')")
 
         elif ctx.state == PersonState.EXITING:
             # Check if crossed door
@@ -243,13 +246,17 @@ class PersonStateMachine:
                 (self.enter_direction_down and y < self.door_y - self.door_threshold) or
                 (not self.enter_direction_down and y > self.door_y + self.door_threshold)
             )
+            logger.debug(
+                f"[STATE] Track {ctx.track_id} EXITING check: y={y}, door_y={self.door_y}, "
+                f"threshold={self.door_threshold}, crossed={crossed}"
+            )
             if crossed:
                 ctx.transition_to(PersonState.LEFT)
                 ctx.exit_time = datetime.now()
                 ctx.exit_box_count = ctx.box_count
                 event = "exited"
                 logger.info(
-                    f"Track {ctx.track_id} ({ctx.identity or 'Unknown'}) "
+                    f"[STATE] Track {ctx.track_id} ({ctx.identity or 'Unknown'}) "
                     f"EXITED with {ctx.box_count} boxes "
                     f"(entered with {ctx.entry_box_count})"
                 )

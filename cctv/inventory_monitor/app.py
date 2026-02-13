@@ -949,6 +949,11 @@ class InventoryMonitor:
                 # Record events
                 if event == "entered":
                     ctx = self.state_machine.get_context(track_id)
+                    logger.info(
+                        f"[EVENT] ENTRY detected: track_id={track_id}, "
+                        f"identity={track.identity or 'UNKNOWN'}, "
+                        f"method={track.match_method}, boxes={track.box_count}"
+                    )
                     self.event_manager.record_entry(
                         track_id=track_id,
                         identity=track.identity,
@@ -957,8 +962,17 @@ class InventoryMonitor:
                         match_method=track.match_method,
                         body_score=track.body_score,
                     )
+                    # Auto-register body when face is recognized on entry
+                    if track.identity and track.identity != "Unknown" and self.body_recognizer:
+                        self._auto_register_body(track_id, track)
+
                 elif event == "exited":
                     ctx = self.state_machine.get_context(track_id)
+                    logger.info(
+                        f"[EVENT] EXIT detected: track_id={track_id}, "
+                        f"identity={track.identity or 'UNKNOWN'}, "
+                        f"method={track.match_method}, boxes={track.box_count}"
+                    )
                     self.event_manager.record_exit(
                         track_id=track_id,
                         identity=track.identity,
@@ -968,6 +982,9 @@ class InventoryMonitor:
                         match_method=track.match_method,
                         body_score=track.body_score,
                     )
+                    # Auto-register body when face is recognized on exit
+                    if track.identity and track.identity != "Unknown" and self.body_recognizer:
+                        self._auto_register_body(track_id, track)
 
         # Auto-registration for unrecognized faces
         self._faces_ready_to_register = []
@@ -1293,3 +1310,34 @@ class InventoryMonitor:
                     if success:
                         track.set_identity(name, 1.0, lock=True)
                         logger.info(f"Registered: {name}")
+
+    def _auto_register_body(self, track_id: int, track):
+        """
+        Auto-register body embedding when face is recognized.
+
+        This links face identity to body appearance so the system can
+        recognize the person by body when facing away.
+        """
+        if not self.body_recognizer:
+            return
+
+        if not track.identity or track.identity == "Unknown":
+            return
+
+        # Get body crop from last frame
+        if self._last_frame is None:
+            return
+
+        body_crop = extract_body_crop(self._last_frame, track.bbox)
+        if body_crop is None:
+            return
+
+        # Check if already registered
+        if self.body_recognizer.has_person(track.identity):
+            # Update existing embedding with new sample
+            if self.body_recognizer.update_body_embedding(track.identity, body_crop):
+                logger.debug(f"[BODY_AUTO] Updated body embedding for '{track.identity}'")
+        else:
+            # Register new body
+            if self.body_recognizer.register_body(track.identity, body_crop):
+                logger.info(f"[BODY_AUTO] Registered new body for '{track.identity}' (linked from face)")

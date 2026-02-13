@@ -481,6 +481,11 @@ class EventManager:
 
         # Send to API
         try:
+            logger.info(
+                f"[API] Sending event: type={event.event_type.value}, "
+                f"track_id={event.track_id}, identity={event.identity or 'UNKNOWN'}, "
+                f"direction={event.direction}"
+            )
             self._api_client.send_event(
                 event_type=event.event_type.value,
                 identity=event.identity,
@@ -492,7 +497,7 @@ class EventManager:
                 image=image_bytes,
             )
         except Exception as e:
-            logger.error(f"Failed to send event to API: {e}")
+            logger.error(f"[API] Failed to send event: {e}")
 
     def disable_api_reporting(self):
         """Disable API reporting and cleanup."""
