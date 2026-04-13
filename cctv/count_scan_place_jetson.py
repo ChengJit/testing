@@ -659,14 +659,7 @@ def run(camera_ip):
 
     print("Connected!")
 
-    ret, frame = cap.read()
-    if ret:
-        print(f"Resolution: {frame.shape[1]}x{frame.shape[0]}")
-        if not headless:
-            tracker.set_roi(frame)
-        else:
-            print("Headless mode: Using full frame (no ROI)")
-
+    # Check headless mode FIRST
     headless = CONFIG.get("headless", False)
     if not headless:
         try:
@@ -674,6 +667,14 @@ def run(camera_ip):
         except:
             print("No display available, switching to headless mode")
             headless = True
+
+    ret, frame = cap.read()
+    if ret:
+        print(f"Resolution: {frame.shape[1]}x{frame.shape[0]}")
+        if not headless:
+            tracker.set_roi(frame)
+        else:
+            print("Headless mode: Using full frame (no ROI)")
 
     if headless:
         print("\n" + "=" * 40)
