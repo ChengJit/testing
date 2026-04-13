@@ -45,7 +45,7 @@ CONFIG = {
     "min_area": 500,
     "max_area": 500000,
     "detect_interval": 1.0,      # Seconds between detections
-    "max_detect_dim": 800,       # Max image size for detection (lower=faster)
+    "max_detect_dim": 640,       # Max image size for detection (lower=faster)
 
     # Tracking settings
     "iou_threshold": 0.15,
@@ -329,7 +329,7 @@ class ScanPlaceTracker:
             work = cv2.resize(work, (int(orig_work_w * detect_scale), int(orig_work_h * detect_scale)))
 
         transform = T.Compose([
-            T.RandomResize([800], max_size=1333),
+            T.RandomResize([640], max_size=800),  # Reduced for faster inference on Jetson
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
