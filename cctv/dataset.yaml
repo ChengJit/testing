@@ -1,0 +1,9 @@
+# YOLOv8 Dataset Configuration
+# Place this file in your cctv folder
+
+path: dataset
+train: images
+val: images
+
+names:
+  0: box
