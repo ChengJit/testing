@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-SCAN-THEN-PLACE Inventory System - JETSON ORIN NANO VERSION
-Optimized for Linux/Jetson with CUDA acceleration
+SCAN-THEN-PLACE Inventory System - YOLOv8 VERSION
+Optimized for speed on Jetson Orin Nano
 
 Setup on Jetson:
 1. Install dependencies:
-   pip install opencv-python numpy pillow
-   pip install torch torchvision  # Use Jetson-specific wheel from NVIDIA
+   pip install ultralytics opencv-python numpy
 
-2. Install GroundingDINO:
-   git clone https://github.com/IDEA-Research/GroundingDINO.git
-   cd GroundingDINO
-   pip install -e .
-   mkdir weights && cd weights
-   wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+2. Run with pretrained model (detects generic boxes):
+   python count_scan_place_yolov8.py 192.168.122.128
 
-3. Run:
-   python count_scan_place_jetson.py 192.168.122.128
+3. Train on your own boxes (see bottom of file for instructions)
 """
 
 import cv2
@@ -29,7 +23,7 @@ import queue
 from datetime import datetime
 from collections import deque
 
-# Suppress OpenCV warnings
+# Suppress warnings
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 # ============ CONFIGURATION ============
@@ -37,28 +31,31 @@ CONFIG = {
     # Camera settings
     "rtsp_user": "fasspay",
     "rtsp_pass": "fasspay2025",
-    "use_hd": True,              # True=HD stream, False=SD stream
+    "use_hd": True,
 
     # Detection settings
-    "confidence": 0.15,          # Detection threshold
-    "prompt": "cardboard box . brown box . package",
+    "confidence": 0.15,
+    "model_path": "yolov8n.pt",  # Use custom model: "runs/detect/train/weights/best.pt"
+    "detect_classes": None,      # None=all, or [0] for person, [39,41,42,64] for bottles/cups/boxes
+    "detect_interval": 0.3,      # Can be much lower with YOLOv8!
+    "input_size": 640,           # YOLO input size
+
+    # Box filtering
     "min_area": 500,
     "max_area": 500000,
-    "detect_interval": 1.0,      # Seconds between detections
-    "max_detect_dim": 640,       # Max image size for detection (lower=faster)
 
     # Tracking settings
     "iou_threshold": 0.15,
     "max_move_distance": 150,
-    "sku_timeout": 60,           # Seconds before pending SKU expires
+    "sku_timeout": 60,
 
     # Display settings
     "display_width": 1280,
     "display_height": 720,
-    "headless": True,            # Set True to run without display
+    "headless": True,
 
     # Logging
-    "log_file": "detection_log.csv",  # Log file for detection counts
+    "log_file": "detection_log.csv",
 }
 # =======================================
 
@@ -66,8 +63,6 @@ CONFIG = {
 def get_jetson_info():
     """Get Jetson device info."""
     info = {"device": "Unknown", "cuda": False}
-
-    # Check for Jetson
     try:
         with open("/proc/device-tree/model", "r") as f:
             model = f.read().strip()
@@ -75,14 +70,11 @@ def get_jetson_info():
                 info["device"] = "Jetson Orin Nano"
             elif "Nano" in model:
                 info["device"] = "Jetson Nano"
-            elif "Xavier" in model:
-                info["device"] = "Jetson Xavier"
             else:
                 info["device"] = model
     except:
         info["device"] = "Linux PC"
 
-    # Check CUDA
     try:
         import torch
         info["cuda"] = torch.cuda.is_available()
@@ -90,7 +82,6 @@ def get_jetson_info():
             info["gpu"] = torch.cuda.get_device_name(0)
     except:
         pass
-
     return info
 
 
@@ -103,7 +94,6 @@ class LatestFrameGrabber:
         self.running = True
         self.lock = threading.Lock()
 
-        # Try GStreamer first (better on Jetson), fallback to FFmpeg
         if use_gstreamer:
             gst_pipeline = self._make_gstreamer_pipeline(url)
             self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
@@ -114,14 +104,10 @@ class LatestFrameGrabber:
             self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
 
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
         self.thread = threading.Thread(target=self._grab_loop, daemon=True)
         self.thread.start()
 
     def _make_gstreamer_pipeline(self, url):
-        """Create GStreamer pipeline for RTSP."""
-        # Extract components from RTSP URL
-        # rtsp://user:pass@ip:port/stream
         return (
             f"rtspsrc location={url} latency=0 ! "
             "rtph264depay ! h264parse ! nvv4l2decoder ! "
@@ -130,7 +116,6 @@ class LatestFrameGrabber:
         )
 
     def _grab_loop(self):
-        """Continuously grab frames, keeping only the latest."""
         while self.running:
             ret, frame = self.cap.read()
             if ret:
@@ -140,7 +125,6 @@ class LatestFrameGrabber:
                 time.sleep(0.01)
 
     def read(self):
-        """Get the latest frame."""
         with self.lock:
             if self.frame is not None:
                 return True, self.frame.copy()
@@ -154,7 +138,7 @@ class LatestFrameGrabber:
         self.cap.release()
 
 
-class ScanPlaceTracker:
+class YOLOv8Tracker:
     def __init__(self, config):
         self.config = config
         self.model = None
@@ -162,9 +146,9 @@ class ScanPlaceTracker:
         self.roi = None
 
         self.confidence = config["confidence"]
-        self.prompt = config["prompt"]
         self.min_area = config["min_area"]
         self.max_area = config["max_area"]
+        self.detect_classes = config["detect_classes"]
 
         # Count stabilization
         self.count_history = []
@@ -188,14 +172,10 @@ class ScanPlaceTracker:
         self.total_scanned = 0
         self.total_placed = 0
 
-    def _download_progress(self, count, block_size, total_size):
-        """Show download progress."""
-        percent = int(count * block_size * 100 / total_size)
-        print(f"\r  Progress: {percent}%", end='', flush=True)
-
     def load(self):
-        """Load detection model."""
+        """Load YOLOv8 model."""
         try:
+            from ultralytics import YOLO
             import torch
 
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -203,68 +183,24 @@ class ScanPlaceTracker:
 
             if self.device == "cuda":
                 print(f"  GPU: {torch.cuda.get_device_name(0)}")
-                print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-            # Find GroundingDINO
-            gdino_paths = [
-                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "GroundingDINO"),
-                os.path.expanduser("~/test/GroundingDINO"),
-                os.path.expanduser("~/GroundingDINO"),
-                "/opt/GroundingDINO",
-                "./GroundingDINO",
-            ]
+            model_path = self.config["model_path"]
+            print(f"  Loading YOLOv8 model: {model_path}")
 
-            gdino_path = None
-            for path in gdino_paths:
-                if os.path.exists(path):
-                    gdino_path = path
-                    break
+            self.model = YOLO(model_path)
 
-            if not gdino_path:
-                print("ERROR: GroundingDINO not found!")
-                print("Install with: git clone https://github.com/IDEA-Research/GroundingDINO.git")
-                return False
-
-            print(f"  GroundingDINO path: {gdino_path}")
-            sys.path.insert(0, gdino_path)
-
-            from groundingdino.util.inference import load_model
-
-            config_path = os.path.join(gdino_path, "groundingdino", "config", "GroundingDINO_SwinT_OGC.py")
-            weights_path = os.path.join(gdino_path, "weights", "groundingdino_swint_ogc.pth")
-
-            if not os.path.exists(weights_path):
-                print(f"Weights not found, downloading...")
-                weights_dir = os.path.dirname(weights_path)
-                os.makedirs(weights_dir, exist_ok=True)
-
-                import urllib.request
-                url = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
-
-                try:
-                    print(f"  Downloading from {url}")
-                    print(f"  This may take a few minutes...")
-                    urllib.request.urlretrieve(url, weights_path, self._download_progress)
-                    print("\n  Download complete!")
-                except Exception as e:
-                    print(f"\nDownload failed: {e}")
-                    print("Manual download:")
-                    print(f"  wget -P {weights_dir} {url}")
-                    return False
-
-            print("  Loading GroundingDINO model...")
-            self.model = load_model(config_path, weights_path, device=self.device)
-            print("  GroundingDINO ready!")
-
-            # Warmup (optional - skip if causing issues)
-            # if self.device == "cuda":
-            #     print("  Warming up GPU...")
-            #     dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-            #     self.detect_boxes(dummy)
-            #     print("  GPU warmed up!")
+            # Warmup
+            print("  Warming up model...")
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            self.model.predict(dummy, verbose=False)
+            print("  YOLOv8 ready!")
 
             return True
 
+        except ImportError:
+            print("ERROR: ultralytics not installed!")
+            print("Install with: pip install ultralytics")
+            return False
         except Exception as e:
             print(f"Error loading model: {e}")
             import traceback
@@ -283,7 +219,6 @@ class ScanPlaceTracker:
     def get_pending_info(self):
         """Get pending SKU with time remaining."""
         now = time.time()
-
         while self.pending_skus:
             if now - self.pending_skus[0]['time'] > self.sku_timeout:
                 expired = self.pending_skus.popleft()
@@ -305,14 +240,9 @@ class ScanPlaceTracker:
         return None
 
     def detect_boxes(self, frame):
-        """Detect boxes."""
+        """Detect boxes using YOLOv8."""
         if self.model is None:
             return []
-
-        import torch
-        from PIL import Image
-        import groundingdino.datasets.transforms as T
-        from groundingdino.util.inference import predict
 
         h, w = frame.shape[:2]
         work = frame
@@ -324,55 +254,38 @@ class ScanPlaceTracker:
             work = frame[y1:y2, x1:x2]
             offset = (x1, y1)
 
-        # Downscale for speed
-        orig_work_h, orig_work_w = work.shape[:2]
-        max_dim = self.config["max_detect_dim"]
-        detect_scale = min(max_dim / orig_work_w, max_dim / orig_work_h, 1.0)
-        if detect_scale < 1.0:
-            work = cv2.resize(work, (int(orig_work_w * detect_scale), int(orig_work_h * detect_scale)))
-
-        transform = T.Compose([
-            T.RandomResize([640], max_size=800),  # Reduced for faster inference on Jetson
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-
-        image_pil = Image.fromarray(cv2.cvtColor(work, cv2.COLOR_BGR2RGB))
-        image_tensor, _ = transform(image_pil, None)
-
-        with torch.no_grad():
-            boxes, logits, phrases = predict(
-                model=self.model,
-                image=image_tensor,
-                caption=self.prompt,
-                box_threshold=self.confidence,
-                text_threshold=self.confidence,
-                device=self.device
-            )
+        # Run YOLOv8 inference
+        results = self.model.predict(
+            work,
+            conf=self.confidence,
+            imgsz=self.config["input_size"],
+            classes=self.detect_classes,
+            verbose=False
+        )
 
         detections = []
-        detect_h, detect_w = work.shape[:2]
+        for result in results:
+            if result.boxes is None:
+                continue
 
-        if detect_scale < 1.0:
-            scale_back = 1.0 / detect_scale
-        else:
-            scale_back = 1.0
+            for box in result.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                score = float(box.conf[0])
+                cls = int(box.cls[0])
 
-        for box, score in zip(boxes, logits):
-            cx, cy, bw, bh = box.tolist()
-            bx1 = int((cx - bw/2) * detect_w * scale_back) + offset[0]
-            by1 = int((cy - bh/2) * detect_h * scale_back) + offset[1]
-            bx2 = int((cx + bw/2) * detect_w * scale_back) + offset[0]
-            by2 = int((cy + bh/2) * detect_h * scale_back) + offset[1]
+                # Adjust for ROI offset
+                bx1 = int(x1) + offset[0]
+                by1 = int(y1) + offset[1]
+                bx2 = int(x2) + offset[0]
+                by2 = int(y2) + offset[1]
 
-            area = (bx2 - bx1) * (by2 - by1)
-            if self.min_area <= area <= self.max_area:
-                detections.append({
-                    'x1': bx1, 'y1': by1, 'x2': bx2, 'y2': by2,
-                    'score': float(score)
-                })
-
-        detections = self._nms(detections, 0.5)
+                area = (bx2 - bx1) * (by2 - by1)
+                if self.min_area <= area <= self.max_area:
+                    detections.append({
+                        'x1': bx1, 'y1': by1, 'x2': bx2, 'y2': by2,
+                        'score': score,
+                        'class': cls
+                    })
 
         # Stabilize count
         self.count_history.append(len(detections))
@@ -381,24 +294,6 @@ class ScanPlaceTracker:
         self.stable_count = sorted(self.count_history)[len(self.count_history)//2]
 
         return detections
-
-    def _nms(self, detections, threshold):
-        if len(detections) <= 1:
-            return detections
-
-        detections = sorted(detections, key=lambda x: x['score'], reverse=True)
-        keep = []
-
-        for det in detections:
-            overlap = False
-            for kept in keep:
-                if self._iou(det, kept) > threshold:
-                    overlap = True
-                    break
-            if not overlap:
-                keep.append(det)
-
-        return keep
 
     def _iou(self, box1, box2):
         x1 = max(box1['x1'], box2['x1'])
@@ -553,9 +448,6 @@ class ScanPlaceTracker:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(display, f"Place box now ({int(remaining)}s)", (20, 125),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-            if remaining < 10:
-                cv2.putText(display, "HURRY!", (250, 125),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         else:
             cv2.putText(display, "Ready - scan SKU", (20, 100),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
@@ -572,7 +464,7 @@ class ScanPlaceTracker:
 
         # Help
         cv2.rectangle(display, (0, h-30), (w, h), (30, 30, 30), -1)
-        cv2.putText(display, "S:Sync/Live | +/-:Thresh | R:ROI | I:List | Q:Quit",
+        cv2.putText(display, "YOLOv8 | +/-:Thresh | R:ROI | I:List | Q:Quit",
                    (10, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         return display
@@ -630,25 +522,21 @@ def run(camera_ip):
     """Main run function."""
     print("=" * 50)
     print("  SCAN-THEN-PLACE INVENTORY SYSTEM")
-    print("  Jetson Orin Nano Edition")
+    print("  YOLOv8 Edition (Fast)")
     print("=" * 50)
 
-    # Check device
     info = get_jetson_info()
     print(f"\nDevice: {info['device']}")
     print(f"CUDA: {'Available' if info['cuda'] else 'Not available'}")
-    if 'gpu' in info:
-        print(f"GPU: {info['gpu']}")
 
     # Build RTSP URL
     stream = "stream1" if CONFIG["use_hd"] else "stream2"
     url = f"rtsp://{CONFIG['rtsp_user']}:{CONFIG['rtsp_pass']}@{camera_ip}:554/{stream}"
 
     print(f"\nConnecting to {'HD' if CONFIG['use_hd'] else 'SD'} stream...")
-    print(f"URL: rtsp://***:***@{camera_ip}:554/{stream}")
 
     # Initialize tracker
-    tracker = ScanPlaceTracker(CONFIG)
+    tracker = YOLOv8Tracker(CONFIG)
     if not tracker.load():
         return
 
@@ -662,11 +550,10 @@ def run(camera_ip):
 
     print("Connected!")
 
-    # Check headless mode FIRST
     headless = CONFIG.get("headless", False)
     if not headless:
         try:
-            cv2.namedWindow("Scan-Place Tracker", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("YOLOv8 Tracker", cv2.WINDOW_NORMAL)
         except:
             print("No display available, switching to headless mode")
             headless = True
@@ -676,34 +563,25 @@ def run(camera_ip):
         print(f"Resolution: {frame.shape[1]}x{frame.shape[0]}")
         if not headless:
             tracker.set_roi(frame)
-        else:
-            print("Headless mode: Using full frame (no ROI)")
 
     if headless:
         print("\n" + "=" * 40)
-        print("  HEADLESS MODE - No display")
+        print("  HEADLESS MODE - YOLOv8")
         print("=" * 40)
-        print("Commands:")
-        print("  <SKU>        - Queue SKU for placement")
-        print("  list         - Show inventory")
-        print("  status       - Show current status")
-        print("  thresh 0.25  - Set detection threshold")
-        print("  quit         - Exit")
-        print("=" * 40 + "\n")
-
-    # Detection thread
-    detections = []
-    detecting = False
-    detect_frame = None
-    detect_result = None
-    display_frame = None
 
     # Initialize log file
     log_file = CONFIG.get("log_file")
     if log_file:
         with open(log_file, "a") as f:
-            f.write(f"\n# Session started: {datetime.now().isoformat()}\n")
+            f.write(f"\n# YOLOv8 Session: {datetime.now().isoformat()}\n")
             f.write("timestamp,detection_time_s,box_count,tagged_count,untagged_count\n")
+
+    # Detection state
+    detections = []
+    detecting = False
+    detect_frame = None
+    detect_result = None
+    display_frame = None
 
     def detect_thread():
         nonlocal detect_result, detecting, display_frame
@@ -716,13 +594,11 @@ def run(camera_ip):
                 display_frame = detect_frame.copy()
                 elapsed = time.time() - start
 
-                # Count tagged vs untagged
                 tagged = sum(1 for d in dets if d.get('sku'))
                 untagged = len(dets) - tagged
 
-                print(f"  Detection: {elapsed:.2f}s, {len(dets)} boxes (tagged:{tagged}, untagged:{untagged})")
+                print(f"  Detection: {elapsed:.3f}s, {len(dets)} boxes (tagged:{tagged}, untagged:{untagged})")
 
-                # Log to file
                 if log_file:
                     with open(log_file, "a") as f:
                         f.write(f"{datetime.now().isoformat()},{elapsed:.3f},{len(dets)},{tagged},{untagged}\n")
@@ -733,7 +609,7 @@ def run(camera_ip):
     last_detect = 0
     detect_interval = CONFIG["detect_interval"]
 
-    # SKU input via stdin
+    # SKU input
     sku_queue = queue.Queue()
     running = True
 
@@ -742,20 +618,17 @@ def run(camera_ip):
             try:
                 line = input()
                 cmd = line.strip().lower()
-
-                # Handle commands
-                if cmd == 'quit' or cmd == 'q':
+                if cmd in ('quit', 'q'):
                     sku_queue.put('__QUIT__')
                     break
-                elif cmd == 'list' or cmd == 'i':
+                elif cmd in ('list', 'i'):
                     sku_queue.put('__LIST__')
                 elif cmd == 'status':
                     sku_queue.put('__STATUS__')
                 elif cmd.startswith('thresh '):
                     sku_queue.put(f'__THRESH__{cmd[7:]}')
                 elif line.strip():
-                    sku = line.strip().upper()
-                    sku_queue.put(sku)
+                    sku_queue.put(line.strip().upper())
             except EOFError:
                 break
             except:
@@ -763,10 +636,7 @@ def run(camera_ip):
 
     input_thread = threading.Thread(target=stdin_reader, daemon=True)
     input_thread.start()
-    print("\n>>> Ready! Scan barcode or type SKU here <<<\n")
-
-    synced_view = True
-    cv_sku_buffer = ""
+    print("\n>>> Ready! Scan barcode or type SKU <<<\n")
 
     try:
         while True:
@@ -775,7 +645,7 @@ def run(camera_ip):
                 time.sleep(0.01)
                 continue
 
-            # Check barcode input and commands
+            # Process commands
             should_quit = False
             try:
                 while True:
@@ -789,10 +659,10 @@ def run(camera_ip):
                     elif item.startswith('__THRESH__'):
                         try:
                             val = float(item[10:])
-                            tracker.confidence = max(0.05, min(0.5, val))
+                            tracker.confidence = max(0.05, min(0.9, val))
                             print(f"  Threshold: {tracker.confidence:.2f}")
                         except:
-                            print("  Usage: thresh 0.25")
+                            pass
                     else:
                         tracker.queue_sku(item)
             except queue.Empty:
@@ -812,32 +682,19 @@ def run(camera_ip):
                 detections = detect_result
                 detect_result = None
 
-            # Display (skip if headless)
+            # Display
             if not headless:
-                if synced_view:
-                    show_frame = display_frame if display_frame is not None else frame
-                else:
-                    show_frame = frame
+                show_frame = display_frame if display_frame is not None else frame
                 display = tracker.draw(show_frame, detections)
 
-                mode_text = "SYNCED" if synced_view else "LIVE"
-                cv2.putText(display, mode_text, (display.shape[1] - 80, 25),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-                if cv_sku_buffer:
-                    cv2.putText(display, f"SKU: {cv_sku_buffer}_", (20, display.shape[0] - 50),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-                # Resize for display
                 dh, dw = display.shape[:2]
                 scale = min(CONFIG["display_width"]/dw, CONFIG["display_height"]/dh, 1.0)
                 if scale < 1:
                     display = cv2.resize(display, (int(dw*scale), int(dh*scale)))
 
-                cv2.imshow("Scan-Place Tracker", display)
+                cv2.imshow("YOLOv8 Tracker", display)
 
                 key = cv2.waitKey(1) & 0xFF
-
                 if key == ord('q'):
                     break
                 elif key == ord('i'):
@@ -845,26 +702,12 @@ def run(camera_ip):
                 elif key == ord('r'):
                     tracker.set_roi(frame)
                 elif key in (ord('+'), ord('=')):
-                    tracker.confidence = min(0.5, tracker.confidence + 0.05)
+                    tracker.confidence = min(0.9, tracker.confidence + 0.05)
                     print(f"  Threshold: {tracker.confidence:.2f}")
                 elif key in (ord('-'), ord('_')):
                     tracker.confidence = max(0.05, tracker.confidence - 0.05)
                     print(f"  Threshold: {tracker.confidence:.2f}")
-                elif key == ord('s'):
-                    synced_view = not synced_view
-                    print(f"  View: {'SYNCED' if synced_view else 'LIVE'}")
-                elif key in (13, 10):
-                    if cv_sku_buffer:
-                        tracker.queue_sku(cv_sku_buffer)
-                        cv_sku_buffer = ""
-                elif key == 8:
-                    cv_sku_buffer = cv_sku_buffer[:-1]
-                elif key == 27:
-                    cv_sku_buffer = ""
-                elif 32 <= key <= 126:
-                    cv_sku_buffer += chr(key).upper()
             else:
-                # Headless mode - just sleep a bit
                 time.sleep(0.01)
 
     finally:
@@ -876,8 +719,33 @@ def run(camera_ip):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python count_scan_place_jetson.py <camera_ip>")
-        print("Example: python count_scan_place_jetson.py 192.168.122.128")
-        print("\nConfiguration can be edited at the top of this file.")
+        print("Usage: python count_scan_place_yolov8.py <camera_ip>")
+        print("\n" + "=" * 50)
+        print("  HOW TO TRAIN ON YOUR OWN BOXES")
+        print("=" * 50)
+        print("""
+1. Collect images:
+   - Save ~50-100 images of your boxes
+   - Put them in: dataset/images/
+
+2. Label images (use LabelImg or Roboflow):
+   - Create bounding boxes around each box
+   - Save labels in YOLO format to: dataset/labels/
+
+3. Create dataset.yaml:
+   path: dataset
+   train: images
+   val: images
+   names:
+     0: box
+
+4. Train:
+   from ultralytics import YOLO
+   model = YOLO('yolov8n.pt')
+   model.train(data='dataset.yaml', epochs=50, imgsz=640)
+
+5. Use trained model:
+   Edit CONFIG["model_path"] = "runs/detect/train/weights/best.pt"
+""")
     else:
         run(sys.argv[1])
