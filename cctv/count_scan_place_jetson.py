@@ -55,7 +55,10 @@ CONFIG = {
     # Display settings
     "display_width": 1280,
     "display_height": 720,
-    "headless": False,           # Set True to run without display
+    "headless": True,            # Set True to run without display
+
+    # Logging
+    "log_file": "detection_log.csv",  # Log file for detection counts
 }
 # =======================================
 
@@ -695,6 +698,13 @@ def run(camera_ip):
     detect_result = None
     display_frame = None
 
+    # Initialize log file
+    log_file = CONFIG.get("log_file")
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"\n# Session started: {datetime.now().isoformat()}\n")
+            f.write("timestamp,detection_time_s,box_count,tagged_count,untagged_count\n")
+
     def detect_thread():
         nonlocal detect_result, detecting, display_frame
         if detect_frame is not None:
@@ -705,7 +715,17 @@ def run(camera_ip):
                 detect_result = dets
                 display_frame = detect_frame.copy()
                 elapsed = time.time() - start
-                print(f"  Detection: {elapsed:.2f}s, {len(dets)} boxes")
+
+                # Count tagged vs untagged
+                tagged = sum(1 for d in dets if d.get('sku'))
+                untagged = len(dets) - tagged
+
+                print(f"  Detection: {elapsed:.2f}s, {len(dets)} boxes (tagged:{tagged}, untagged:{untagged})")
+
+                # Log to file
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"{datetime.now().isoformat()},{elapsed:.3f},{len(dets)},{tagged},{untagged}\n")
             except Exception as e:
                 print(f"Detection error: {e}")
         detecting = False
