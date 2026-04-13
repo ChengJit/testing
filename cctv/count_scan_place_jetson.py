@@ -55,6 +55,7 @@ CONFIG = {
     # Display settings
     "display_width": 1280,
     "display_height": 720,
+    "headless": False,           # Set True to run without display
 }
 # =======================================
 
@@ -184,6 +185,11 @@ class ScanPlaceTracker:
         self.total_scanned = 0
         self.total_placed = 0
 
+    def _download_progress(self, count, block_size, total_size):
+        """Show download progress."""
+        percent = int(count * block_size * 100 / total_size)
+        print(f"\r  Progress: {percent}%", end='', flush=True)
+
     def load(self):
         """Load detection model."""
         try:
@@ -224,11 +230,23 @@ class ScanPlaceTracker:
             weights_path = os.path.join(gdino_path, "weights", "groundingdino_swint_ogc.pth")
 
             if not os.path.exists(weights_path):
-                print(f"ERROR: Weights not found at {weights_path}")
-                print("Download with:")
-                print(f"  mkdir -p {os.path.dirname(weights_path)}")
-                print(f"  wget -P {os.path.dirname(weights_path)} https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth")
-                return False
+                print(f"Weights not found, downloading...")
+                weights_dir = os.path.dirname(weights_path)
+                os.makedirs(weights_dir, exist_ok=True)
+
+                import urllib.request
+                url = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+
+                try:
+                    print(f"  Downloading from {url}")
+                    print(f"  This may take a few minutes...")
+                    urllib.request.urlretrieve(url, weights_path, self._download_progress)
+                    print("\n  Download complete!")
+                except Exception as e:
+                    print(f"\nDownload failed: {e}")
+                    print("Manual download:")
+                    print(f"  wget -P {weights_dir} {url}")
+                    return False
 
             print("  Loading GroundingDINO model...")
             self.model = load_model(config_path, weights_path, device=self.device)
@@ -643,9 +661,30 @@ def run(camera_ip):
     ret, frame = cap.read()
     if ret:
         print(f"Resolution: {frame.shape[1]}x{frame.shape[0]}")
-        tracker.set_roi(frame)
+        if not headless:
+            tracker.set_roi(frame)
+        else:
+            print("Headless mode: Using full frame (no ROI)")
 
-    cv2.namedWindow("Scan-Place Tracker", cv2.WINDOW_NORMAL)
+    headless = CONFIG.get("headless", False)
+    if not headless:
+        try:
+            cv2.namedWindow("Scan-Place Tracker", cv2.WINDOW_NORMAL)
+        except:
+            print("No display available, switching to headless mode")
+            headless = True
+
+    if headless:
+        print("\n" + "=" * 40)
+        print("  HEADLESS MODE - No display")
+        print("=" * 40)
+        print("Commands:")
+        print("  <SKU>        - Queue SKU for placement")
+        print("  list         - Show inventory")
+        print("  status       - Show current status")
+        print("  thresh 0.25  - Set detection threshold")
+        print("  quit         - Exit")
+        print("=" * 40 + "\n")
 
     # Detection thread
     detections = []
@@ -680,8 +719,20 @@ def run(camera_ip):
         while running:
             try:
                 line = input()
-                sku = line.strip().upper()
-                if sku:
+                cmd = line.strip().lower()
+
+                # Handle commands
+                if cmd == 'quit' or cmd == 'q':
+                    sku_queue.put('__QUIT__')
+                    break
+                elif cmd == 'list' or cmd == 'i':
+                    sku_queue.put('__LIST__')
+                elif cmd == 'status':
+                    sku_queue.put('__STATUS__')
+                elif cmd.startswith('thresh '):
+                    sku_queue.put(f'__THRESH__{cmd[7:]}')
+                elif line.strip():
+                    sku = line.strip().upper()
                     sku_queue.put(sku)
             except EOFError:
                 break
@@ -702,13 +753,31 @@ def run(camera_ip):
                 time.sleep(0.01)
                 continue
 
-            # Check barcode input
+            # Check barcode input and commands
+            should_quit = False
             try:
                 while True:
-                    sku = sku_queue.get_nowait()
-                    tracker.queue_sku(sku)
+                    item = sku_queue.get_nowait()
+                    if item == '__QUIT__':
+                        should_quit = True
+                    elif item == '__LIST__':
+                        tracker.print_inventory()
+                    elif item == '__STATUS__':
+                        print(f"\n  Boxes: {tracker.stable_count} | Tagged: {len(tracker.inventory)} | Pending: {len(tracker.pending_skus)}\n")
+                    elif item.startswith('__THRESH__'):
+                        try:
+                            val = float(item[10:])
+                            tracker.confidence = max(0.05, min(0.5, val))
+                            print(f"  Threshold: {tracker.confidence:.2f}")
+                        except:
+                            print("  Usage: thresh 0.25")
+                    else:
+                        tracker.queue_sku(item)
             except queue.Empty:
                 pass
+
+            if should_quit:
+                break
 
             # Background detection
             if not detecting and time.time() - last_detect >= detect_interval:
@@ -721,56 +790,60 @@ def run(camera_ip):
                 detections = detect_result
                 detect_result = None
 
-            # Display
-            if synced_view:
-                show_frame = display_frame if display_frame is not None else frame
-            else:
-                show_frame = frame
-            display = tracker.draw(show_frame, detections)
+            # Display (skip if headless)
+            if not headless:
+                if synced_view:
+                    show_frame = display_frame if display_frame is not None else frame
+                else:
+                    show_frame = frame
+                display = tracker.draw(show_frame, detections)
 
-            mode_text = "SYNCED" if synced_view else "LIVE"
-            cv2.putText(display, mode_text, (display.shape[1] - 80, 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                mode_text = "SYNCED" if synced_view else "LIVE"
+                cv2.putText(display, mode_text, (display.shape[1] - 80, 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-            if cv_sku_buffer:
-                cv2.putText(display, f"SKU: {cv_sku_buffer}_", (20, display.shape[0] - 50),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-            # Resize for display
-            dh, dw = display.shape[:2]
-            scale = min(CONFIG["display_width"]/dw, CONFIG["display_height"]/dh, 1.0)
-            if scale < 1:
-                display = cv2.resize(display, (int(dw*scale), int(dh*scale)))
-
-            cv2.imshow("Scan-Place Tracker", display)
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('q'):
-                break
-            elif key == ord('i'):
-                tracker.print_inventory()
-            elif key == ord('r'):
-                tracker.set_roi(frame)
-            elif key in (ord('+'), ord('=')):
-                tracker.confidence = min(0.5, tracker.confidence + 0.05)
-                print(f"  Threshold: {tracker.confidence:.2f}")
-            elif key in (ord('-'), ord('_')):
-                tracker.confidence = max(0.05, tracker.confidence - 0.05)
-                print(f"  Threshold: {tracker.confidence:.2f}")
-            elif key == ord('s'):
-                synced_view = not synced_view
-                print(f"  View: {'SYNCED' if synced_view else 'LIVE'}")
-            elif key in (13, 10):
                 if cv_sku_buffer:
-                    tracker.queue_sku(cv_sku_buffer)
+                    cv2.putText(display, f"SKU: {cv_sku_buffer}_", (20, display.shape[0] - 50),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+                # Resize for display
+                dh, dw = display.shape[:2]
+                scale = min(CONFIG["display_width"]/dw, CONFIG["display_height"]/dh, 1.0)
+                if scale < 1:
+                    display = cv2.resize(display, (int(dw*scale), int(dh*scale)))
+
+                cv2.imshow("Scan-Place Tracker", display)
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord('q'):
+                    break
+                elif key == ord('i'):
+                    tracker.print_inventory()
+                elif key == ord('r'):
+                    tracker.set_roi(frame)
+                elif key in (ord('+'), ord('=')):
+                    tracker.confidence = min(0.5, tracker.confidence + 0.05)
+                    print(f"  Threshold: {tracker.confidence:.2f}")
+                elif key in (ord('-'), ord('_')):
+                    tracker.confidence = max(0.05, tracker.confidence - 0.05)
+                    print(f"  Threshold: {tracker.confidence:.2f}")
+                elif key == ord('s'):
+                    synced_view = not synced_view
+                    print(f"  View: {'SYNCED' if synced_view else 'LIVE'}")
+                elif key in (13, 10):
+                    if cv_sku_buffer:
+                        tracker.queue_sku(cv_sku_buffer)
+                        cv_sku_buffer = ""
+                elif key == 8:
+                    cv_sku_buffer = cv_sku_buffer[:-1]
+                elif key == 27:
                     cv_sku_buffer = ""
-            elif key == 8:
-                cv_sku_buffer = cv_sku_buffer[:-1]
-            elif key == 27:
-                cv_sku_buffer = ""
-            elif 32 <= key <= 126:
-                cv_sku_buffer += chr(key).upper()
+                elif 32 <= key <= 126:
+                    cv_sku_buffer += chr(key).upper()
+            else:
+                # Headless mode - just sleep a bit
+                time.sleep(0.01)
 
     finally:
         running = False
