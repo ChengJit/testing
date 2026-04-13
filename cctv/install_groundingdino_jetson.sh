@@ -65,15 +65,8 @@ if os.path.exists(f2):
         f.write(c)
     print(f"  Patched: {f2}")
 
-# Patch 3: Force PyTorch implementation (skip CUDA ops that may fail)
-f3 = "groundingdino/models/GroundingDINO/ms_deform_attn.py"
-if os.path.exists(f3):
-    with open(f3, 'r') as f:
-        c = f.read()
-    c = c.replace("MultiScaleDeformableAttnFunction.apply(", "multi_scale_deformable_attn_pytorch(")
-    with open(f3, 'w') as f:
-        f.write(c)
-    print(f"  Patched: {f3}")
+# Note: NOT patching ms_deform_attn.py - CUDA ops should compile fine
+print("  Skipping ms_deform_attn.py patch (CUDA ops will be used)")
 
 print("Done patching!")
 PATCHSCRIPT
