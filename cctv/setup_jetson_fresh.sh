@@ -59,11 +59,14 @@ if [ -f "$SWIN_FILE" ]; then
     echo "  Patched: $SWIN_FILE"
 fi
 
-# 5. Build and install
+# 5. Build and install (use setup.py directly, not pip install -e)
 echo ""
 echo "[5/7] Building GroundingDINO (this may take a few minutes)..."
 export TORCH_CUDA_ARCH_LIST="8.7"  # Jetson Orin architecture
-pip3 install -e .
+
+# Use setup.py directly to avoid isolated build environment
+python3 setup.py build
+python3 setup.py install --user
 
 # 6. Download weights
 echo ""
