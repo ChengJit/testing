@@ -252,12 +252,12 @@ class ScanPlaceTracker:
             self.model = load_model(config_path, weights_path, device=self.device)
             print("  GroundingDINO ready!")
 
-            # Warmup
-            if self.device == "cuda":
-                print("  Warming up GPU...")
-                dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-                self.detect_boxes(dummy)
-                print("  GPU warmed up!")
+            # Warmup (optional - skip if causing issues)
+            # if self.device == "cuda":
+            #     print("  Warming up GPU...")
+            #     dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            #     self.detect_boxes(dummy)
+            #     print("  GPU warmed up!")
 
             return True
 
