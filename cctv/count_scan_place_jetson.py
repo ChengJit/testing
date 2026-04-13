@@ -205,6 +205,7 @@ class ScanPlaceTracker:
             # Find GroundingDINO
             gdino_paths = [
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "GroundingDINO"),
+                os.path.expanduser("~/test/GroundingDINO"),
                 os.path.expanduser("~/GroundingDINO"),
                 "/opt/GroundingDINO",
                 "./GroundingDINO",

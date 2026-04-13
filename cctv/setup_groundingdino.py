@@ -64,42 +64,57 @@ def main():
     # Step 5: Patch files for PyTorch 2.x compatibility
     print("\n[5/7] Patching files for PyTorch 2.x...")
 
-    patches = [
-        {
-            "file": "groundingdino/models/GroundingDINO/csrc/MsDeformAttn/ms_deform_attn_cuda.cu",
-            "find": "value.type()",
-            "replace": "value.scalar_type()"
-        },
-        {
-            "file": "groundingdino/models/GroundingDINO/csrc/MsDeformAttn/ms_deform_attn.h",
-            "find": "value.type().is_cuda()",
-            "replace": "value.is_cuda()"
-        },
-        {
-            "file": "groundingdino/models/GroundingDINO/backbone/swin_transformer.py",
-            "find": "from timm.models.layers import",
-            "replace": "from timm.layers import"
-        },
-    ]
+    # Patch CUDA file - need to replace the entire AT_DISPATCH line
+    cuda_file = os.path.join(GDINO_DIR, "groundingdino/models/GroundingDINO/csrc/MsDeformAttn/ms_deform_attn_cuda.cu")
+    if os.path.exists(cuda_file):
+        try:
+            with open(cuda_file, 'r') as f:
+                content = f.read()
 
-    for patch in patches:
-        filepath = os.path.join(GDINO_DIR, patch["file"])
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'r') as f:
-                    content = f.read()
+            # Replace AT_DISPATCH_FLOATING_TYPES(value.type() with AT_DISPATCH_FLOATING_TYPES(value.scalar_type()
+            content = content.replace(
+                "AT_DISPATCH_FLOATING_TYPES(value.type(),",
+                "AT_DISPATCH_FLOATING_TYPES(value.scalar_type(),"
+            )
 
-                if patch["find"] in content:
-                    content = content.replace(patch["find"], patch["replace"])
-                    with open(filepath, 'w') as f:
-                        f.write(content)
-                    print(f"  Patched: {patch['file']}")
-                else:
-                    print(f"  Already patched or not found: {patch['file']}")
-            except Exception as e:
-                print(f"  Error patching {patch['file']}: {e}")
-        else:
-            print(f"  File not found: {patch['file']}")
+            with open(cuda_file, 'w') as f:
+                f.write(content)
+            print(f"  Patched: ms_deform_attn_cuda.cu")
+        except Exception as e:
+            print(f"  Error patching CUDA file: {e}")
+
+    # Patch header file
+    header_file = os.path.join(GDINO_DIR, "groundingdino/models/GroundingDINO/csrc/MsDeformAttn/ms_deform_attn.h")
+    if os.path.exists(header_file):
+        try:
+            with open(header_file, 'r') as f:
+                content = f.read()
+
+            content = content.replace("value.type().is_cuda()", "value.is_cuda()")
+
+            with open(header_file, 'w') as f:
+                f.write(content)
+            print(f"  Patched: ms_deform_attn.h")
+        except Exception as e:
+            print(f"  Error patching header file: {e}")
+
+    # Patch swin transformer
+    swin_file = os.path.join(GDINO_DIR, "groundingdino/models/GroundingDINO/backbone/swin_transformer.py")
+    if os.path.exists(swin_file):
+        try:
+            with open(swin_file, 'r') as f:
+                content = f.read()
+
+            content = content.replace(
+                "from timm.models.layers import",
+                "from timm.layers import"
+            )
+
+            with open(swin_file, 'w') as f:
+                f.write(content)
+            print(f"  Patched: swin_transformer.py")
+        except Exception as e:
+            print(f"  Error patching swin file: {e}")
 
     # Step 6: Build and install
     print("\n[6/7] Building GroundingDINO (this takes a few minutes)...")
@@ -115,8 +130,31 @@ def main():
         print("  Running: python3 setup.py install --user")
         run_cmd("python3 setup.py install --user", check=False)
     else:
-        print("  Build failed, trying alternative method...")
-        run_cmd("pip3 install --no-build-isolation .", check=False)
+        print("\n  CUDA build failed!")
+        print("  Trying CPU-only mode (slower but works)...")
+
+        # Patch ms_deform_attn.py to force PyTorch implementation
+        attn_py = os.path.join(GDINO_DIR, "groundingdino/models/GroundingDINO/ms_deform_attn.py")
+        if os.path.exists(attn_py):
+            with open(attn_py, 'r') as f:
+                content = f.read()
+
+            # Force CPU mode by making _C import always fail
+            if "try:" in content and "import MultiScaleDeformableAttention as _C" in content:
+                content = content.replace(
+                    "import MultiScaleDeformableAttention as _C",
+                    "raise ImportError('Force CPU mode')"
+                )
+                with open(attn_py, 'w') as f:
+                    f.write(content)
+                print("  Forced CPU mode in ms_deform_attn.py")
+
+        # Install without building CUDA extensions
+        print("  Installing without CUDA extensions...")
+        run_cmd("pip3 install --no-build-isolation --no-deps .", check=False)
+
+        # Also try just adding to path
+        print("  Adding to Python path as fallback...")
 
     # Step 7: Download weights
     print("\n[7/7] Downloading model weights...")
@@ -140,23 +178,21 @@ def main():
     print("  TESTING INSTALLATION")
     print("=" * 50)
 
-    test_code = '''
-import torch
-print(f"PyTorch: {torch.__version__}")
-print(f"CUDA: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    try:
+        import torch
+        print(f"PyTorch: {torch.__version__}")
+        print(f"CUDA: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+    except:
+        print("PyTorch not available")
 
-try:
-    import sys
-    sys.path.insert(0, "{gdino_dir}")
-    from groundingdino.util.inference import load_model
-    print("GroundingDINO import: SUCCESS!")
-except Exception as e:
-    print(f"GroundingDINO import: FAILED - {{e}}")
-'''.format(gdino_dir=GDINO_DIR)
-
-    run_cmd(f'python3 -c "{test_code}"', check=False)
+    try:
+        sys.path.insert(0, GDINO_DIR)
+        from groundingdino.util.inference import load_model
+        print("GroundingDINO import: SUCCESS!")
+    except Exception as e:
+        print(f"GroundingDINO import: FAILED - {e}")
 
     print("\n" + "=" * 50)
     print("  SETUP COMPLETE!")
