@@ -1,0 +1,29 @@
+
+# go2rtc config for Tapo TC74
+# Supports two-way audio!
+
+streams:
+  tapo_camera:
+    - rtsp://fasspay:fasspay2025@192.168.122.129:554/stream1#backchannel=1
+
+  tapo_hd:
+    - rtsp://fasspay:fasspay2025@192.168.122.129:554/stream1#backchannel=1
+
+  tapo_sd:
+    - rtsp://fasspay:fasspay2025@192.168.122.129:554/stream2#backchannel=1
+
+# Enable WebRTC for browser access with two-way audio
+webrtc:
+  listen: ":8555"
+
+# API server
+api:
+  listen: ":1984"
+
+# Enable RTSP server
+rtsp:
+  listen: ":8554"
+
+# Log level
+log:
+  level: info

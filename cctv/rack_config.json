@@ -1,0 +1,29 @@
+{
+  "cameras": [
+    {
+      "name": "Rack-Cam-2",
+      "ip": "192.168.122.128",
+      "username": "fasspay",
+      "password": "fasspay2025",
+      "port": 554,
+      "stream": "stream1",
+      "enabled": true
+    },
+    {
+      "name": "Rack-Cam-3",
+      "ip": "192.168.122.129",
+      "username": "fasspay",
+      "password": "fasspay2025",
+      "port": 554,
+      "stream": "stream1",
+      "enabled": true
+    }
+  ],
+  "zones": [],
+  "detection_model": "yolo11n.pt",
+  "detection_confidence": 0.5,
+  "grid_columns": 2,
+  "window_width": 1920,
+  "window_height": 1080
+  "scan_interval": 5.0
+}

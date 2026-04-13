@@ -1,0 +1,7 @@
+# Box Detection Dataset
+path: C:\Users\Cheng Jit Giam\testing\cctv\box_dataset
+train: train/images
+val: val/images
+
+names:
+  0: box

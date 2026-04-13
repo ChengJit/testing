@@ -11,7 +11,13 @@
       "Bash(run_monitor \")",
       "Bash(dir /b \"C:\\\\Users\\\\Cheng Jit Giam\\\\testing2\")",
       "Bash(uv tool list:*)",
-      "Bash(findstr:*)"
+      "Bash(findstr:*)",
+      "Bash(claude plugin marketplace:*)",
+      "Bash(claude plugin install:*)",
+      "WebSearch",
+      "Bash(pip install:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(python:*)"
     ]
   }
 }
