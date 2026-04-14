@@ -39,7 +39,7 @@ CONFIG = {
 
     # Dataset settings
     "output_dir": "dataset",
-    "target_images": 100,
+    "target_images": 500,
     "min_boxes_per_frame": 1,    # Only save frames with at least this many boxes
     "auto_interval": 2.0,        # Seconds between auto-captures
 
