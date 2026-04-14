@@ -703,7 +703,14 @@ def run(camera_ip):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python count_scan_place_qr.py <camera_ip> [--headless]")
+        print("Usage: python count_scan_place_qr.py <camera_ip> [options]")
+        print("\nOptions:")
+        print("  --headless        Run without display")
+        print("  --threshold N     Set detection threshold (default: 0.15)")
+        print("\nExamples:")
+        print("  python count_scan_place_qr.py 192.168.122.128")
+        print("  python count_scan_place_qr.py 192.168.122.128 --headless")
+        print("  python count_scan_place_qr.py 192.168.122.128 --threshold 0.25")
         print("\nThis script:")
         print("  - Detects boxes using YOLOv8")
         print("  - Reads QR codes on boxes automatically")
@@ -713,4 +720,12 @@ if __name__ == "__main__":
     else:
         if "--headless" in sys.argv:
             CONFIG["headless"] = True
+
+        if "--threshold" in sys.argv:
+            try:
+                idx = sys.argv.index("--threshold")
+                CONFIG["confidence"] = float(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                print("Warning: Invalid threshold, using default")
+
         run(sys.argv[1])
