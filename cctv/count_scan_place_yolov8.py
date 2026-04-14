@@ -52,7 +52,7 @@ CONFIG = {
     # Display settings
     "display_width": 1280,
     "display_height": 720,
-    "headless": True,
+    "headless": False,
 
     # Logging
     "log_file": "detection_log.csv",
@@ -718,8 +718,15 @@ def run(camera_ip):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python count_scan_place_yolov8.py <camera_ip>")
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: python count_scan_place_yolov8.py <camera_ip> [options]")
+        print("\nOptions:")
+        print("  --headless    Run without display")
+        print("  --threshold N Set detection threshold (default: 0.15)")
+        print("\nExamples:")
+        print("  python count_scan_place_yolov8.py 192.168.122.128")
+        print("  python count_scan_place_yolov8.py 192.168.122.128 --headless")
+        print("  python count_scan_place_yolov8.py 192.168.122.128 --threshold 0.25")
         print("\n" + "=" * 50)
         print("  HOW TO TRAIN ON YOUR OWN BOXES")
         print("=" * 50)
@@ -748,4 +755,17 @@ if __name__ == "__main__":
    Edit CONFIG["model_path"] = "runs/detect/train/weights/best.pt"
 """)
     else:
-        run(sys.argv[1])
+        # Parse command line arguments
+        camera_ip = sys.argv[1]
+
+        if "--headless" in sys.argv:
+            CONFIG["headless"] = True
+
+        if "--threshold" in sys.argv:
+            try:
+                idx = sys.argv.index("--threshold")
+                CONFIG["confidence"] = float(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                print("Warning: Invalid threshold value, using default")
+
+        run(camera_ip)
