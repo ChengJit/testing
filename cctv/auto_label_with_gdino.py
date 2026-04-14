@@ -179,17 +179,28 @@ class GroundingDINOLabeler:
             )
 
         detections = []
-        work_h, work_w = work.shape[:2]
 
         for box, score in zip(boxes, logits):
             cx, cy, bw, bh = box.tolist()
 
-            # Scale back to original frame size
-            if scale < 1.0:
-                cx, cy = cx / scale, cy / scale
-                bw, bh = bw / scale, bh / scale
+            # GroundingDINO returns normalized coords (0-1)
+            # Clamp to valid range to ensure YOLO format compliance
+            cx = max(0.001, min(0.999, cx))
+            cy = max(0.001, min(0.999, cy))
+            bw = max(0.001, min(0.998, bw))
+            bh = max(0.001, min(0.998, bh))
 
-            # Convert to pixel coords for filtering
+            # Ensure box doesn't exceed image bounds
+            if cx - bw/2 < 0:
+                bw = cx * 2
+            if cx + bw/2 > 1:
+                bw = (1 - cx) * 2
+            if cy - bh/2 < 0:
+                bh = cy * 2
+            if cy + bh/2 > 1:
+                bh = (1 - cy) * 2
+
+            # Convert to pixel coords for filtering (use original frame size)
             px1 = int((cx - bw/2) * w)
             py1 = int((cy - bh/2) * h)
             px2 = int((cx + bw/2) * w)
