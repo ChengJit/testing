@@ -99,6 +99,16 @@ class QRBoxTracker:
         self.model = None
         self.qr_detector = cv2.QRCodeDetector()
 
+        # Try to use pyzbar (better for small QR codes)
+        self.use_pyzbar = False
+        try:
+            from pyzbar import pyzbar
+            self.pyzbar = pyzbar
+            self.use_pyzbar = True
+            print("  Using pyzbar for QR detection (better accuracy)")
+        except ImportError:
+            print("  Using OpenCV QR detector (install pyzbar for better detection)")
+
         self.confidence = config["confidence"]
         self.min_area = config["min_area"]
         self.max_area = config["max_area"]
@@ -149,14 +159,41 @@ class QRBoxTracker:
         """Detect QR codes in frame."""
         qr_codes = []
 
-        # Try OpenCV QR detector
+        # Use pyzbar if available (better for small QR codes)
+        if self.use_pyzbar:
+            try:
+                decoded = self.pyzbar.decode(frame)
+                for obj in decoded:
+                    data = obj.data.decode('utf-8')
+                    pts = np.array(obj.polygon, dtype=np.int32)
+                    if len(pts) >= 4:
+                        cx = int(np.mean([p.x for p in obj.polygon]))
+                        cy = int(np.mean([p.y for p in obj.polygon]))
+                        rect = obj.rect
+                        pts = np.array([
+                            [rect.left, rect.top],
+                            [rect.left + rect.width, rect.top],
+                            [rect.left + rect.width, rect.top + rect.height],
+                            [rect.left, rect.top + rect.height]
+                        ], dtype=np.int32)
+                        qr_codes.append({
+                            'data': data,
+                            'center': (cx, cy),
+                            'points': pts
+                        })
+            except Exception as e:
+                pass
+
+            if qr_codes:
+                return qr_codes
+
+        # Fallback: OpenCV QR detector
         try:
             retval, decoded_info, points, _ = self.qr_detector.detectAndDecodeMulti(frame)
             if retval and points is not None:
                 for i, data in enumerate(decoded_info):
-                    if data:  # Non-empty QR data
+                    if data:
                         pts = points[i].astype(int)
-                        # Calculate center
                         cx = int(np.mean(pts[:, 0]))
                         cy = int(np.mean(pts[:, 1]))
                         qr_codes.append({
@@ -167,7 +204,7 @@ class QRBoxTracker:
         except:
             pass
 
-        # Fallback: try single QR detection
+        # Fallback: single QR detection
         if not qr_codes:
             try:
                 data, points, _ = self.qr_detector.detectAndDecode(frame)
