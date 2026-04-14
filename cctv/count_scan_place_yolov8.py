@@ -638,6 +638,9 @@ def run(camera_ip):
     input_thread.start()
     print("\n>>> Ready! Scan barcode or type SKU <<<\n")
 
+    # SKU buffer for keyboard input in OpenCV window
+    cv_sku_buffer = ""
+
     try:
         while True:
             ret, frame = cap.read()
@@ -692,6 +695,11 @@ def run(camera_ip):
                 if scale < 1:
                     display = cv2.resize(display, (int(dw*scale), int(dh*scale)))
 
+                # Show SKU buffer if typing
+                if cv_sku_buffer:
+                    cv2.putText(display, f"SKU: {cv_sku_buffer}_", (20, display.shape[0] - 50),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
                 cv2.imshow("YOLOv8 Tracker", display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -707,6 +715,16 @@ def run(camera_ip):
                 elif key in (ord('-'), ord('_')):
                     tracker.confidence = max(0.05, tracker.confidence - 0.05)
                     print(f"  Threshold: {tracker.confidence:.2f}")
+                elif key in (13, 10):  # Enter key - submit SKU
+                    if cv_sku_buffer:
+                        tracker.queue_sku(cv_sku_buffer)
+                        cv_sku_buffer = ""
+                elif key == 8:  # Backspace
+                    cv_sku_buffer = cv_sku_buffer[:-1]
+                elif key == 27:  # Escape - clear buffer
+                    cv_sku_buffer = ""
+                elif 32 <= key <= 126:  # Printable characters
+                    cv_sku_buffer += chr(key).upper()
             else:
                 time.sleep(0.01)
 
