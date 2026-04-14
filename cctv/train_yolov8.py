@@ -17,10 +17,10 @@ CONFIG = {
     "model": "yolov8n.pt",       # Base model (n=nano, s=small, m=medium)
     "data": "dataset.yaml",      # Dataset config
     "epochs": 50,                # Training epochs
-    "imgsz": 640,                # Image size
-    "batch": 8,                  # Batch size (lower if OOM on Jetson)
+    "imgsz": 480,                # Image size (reduced for Jetson memory)
+    "batch": 4,                  # Batch size (reduced for Jetson Orin Nano)
     "device": 0,                 # GPU device (0) or "cpu"
-    "workers": 4,                # Data loader workers
+    "workers": 2,                # Data loader workers (reduced)
     "patience": 10,              # Early stopping patience
 }
 # =======================================
