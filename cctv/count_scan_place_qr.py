@@ -21,6 +21,14 @@ from collections import deque
 
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
+# API Client for sending events to ops-portal
+try:
+    from inventory_api_client import InventoryAPIClient
+    API_AVAILABLE = True
+except ImportError:
+    API_AVAILABLE = False
+    print("Warning: inventory_api_client not found, API reporting disabled")
+
 # ============ CONFIGURATION ============
 CONFIG = {
     # Camera
@@ -53,6 +61,12 @@ CONFIG = {
 
     # Logging
     "log_file": "qr_tracking_log.csv",
+
+    # API Config
+    "api_enabled": True,
+    "api_url": "https://ops-portal.fasspay.com/report/inventory",
+    "api_camera_id": "jetson-qr-scanner-01",
+    "api_verify_ssl": True,
 }
 # =======================================
 
@@ -98,6 +112,22 @@ class QRBoxTracker:
         self.config = config
         self.model = None
         self.qr_detector = cv2.QRCodeDetector()
+
+        # Initialize API client
+        self.api_client = None
+        if API_AVAILABLE and config.get("api_enabled", False):
+            try:
+                self.api_client = InventoryAPIClient(
+                    base_url=config.get("api_url", "https://ops-portal.fasspay.com/report/inventory"),
+                    camera_id=config.get("api_camera_id", "jetson-qr-scanner-01"),
+                    verify_ssl=config.get("api_verify_ssl", True),
+                    async_mode=True
+                )
+                self.api_client.start_heartbeat(interval=30)
+                print("  API client initialized")
+            except Exception as e:
+                print(f"  API client init failed: {e}")
+                self.api_client = None
 
         # Try to use pyzbar (better for small QR codes)
         self.use_pyzbar = False
@@ -370,6 +400,10 @@ class QRBoxTracker:
                             self.inventory[ghost['id']]['status'] = 'active'
                             self.inventory[ghost['id']]['returned'] = datetime.now().isoformat()
 
+                        # Send API event: box returned
+                        if self.api_client:
+                            self.api_client.send_box_returned(sku=qr, box_id=ghost['id'])
+
                         self.ghost_boxes.pop(g)
                         break
 
@@ -413,14 +447,23 @@ class QRBoxTracker:
                     tb['qr_data'] = det['qr_data']
                     print(f"\n  [LINKED] Box #{tb['id']} = {det['qr_data']}")
 
+                    zone = self._get_zone(det)
                     # Add to inventory
                     self.inventory[tb['id']] = {
                         'sku': det['qr_data'],
-                        'zone': self._get_zone(det),
+                        'zone': zone,
                         'time': datetime.now().isoformat(),
                         'status': 'active'
                     }
                     self.total_checked_in += 1
+
+                    # Send API event: new box (QR linked)
+                    if self.api_client:
+                        self.api_client.send_box_new(
+                            sku=det['qr_data'],
+                            box_id=tb['id'],
+                            zone=zone
+                        )
 
                 det['box_id'] = tb['id']
                 det['sku'] = tb.get('qr_data')
@@ -446,13 +489,22 @@ class QRBoxTracker:
                 new_box['qr_data'] = det['qr_data']
                 print(f"\n  [NEW] Box #{self.next_box_id} = {det['qr_data']}")
 
+                zone = self._get_zone(det)
                 self.inventory[self.next_box_id] = {
                     'sku': det['qr_data'],
-                    'zone': self._get_zone(det),
+                    'zone': zone,
                     'time': datetime.now().isoformat(),
                     'status': 'active'
                 }
                 self.total_checked_in += 1
+
+                # Send API event: new box
+                if self.api_client:
+                    self.api_client.send_box_new(
+                        sku=det['qr_data'],
+                        box_id=self.next_box_id,
+                        zone=zone
+                    )
             else:
                 print(f"\n  [NEW] Box #{self.next_box_id} (no QR)")
 
@@ -475,6 +527,10 @@ class QRBoxTracker:
                     if tb['id'] in self.inventory:
                         self.inventory[tb['id']]['status'] = 'removed'
                         self.inventory[tb['id']]['removed_time'] = datetime.now().isoformat()
+
+                    # Send API event: box removed
+                    if self.api_client:
+                        self.api_client.send_box_removed(sku=tb['qr_data'], box_id=tb['id'])
             else:
                 still_active.append(tb)
 
@@ -488,6 +544,11 @@ class QRBoxTracker:
                 if ghost['id'] in self.inventory:
                     self.inventory[ghost['id']]['status'] = 'checked_out'
                     self.inventory[ghost['id']]['checkout_time'] = datetime.now().isoformat()
+
+                # Send API event: box checked out
+                if self.api_client:
+                    self.api_client.send_box_checked_out(sku=ghost['qr_data'], box_id=ghost['id'])
+
                 self.total_checked_out += 1
             else:
                 active_ghosts.append(ghost)
@@ -699,6 +760,11 @@ def run(camera_ip):
         cap.release()
         cv2.destroyAllWindows()
         tracker.print_inventory()
+
+        # Stop API client
+        if tracker.api_client:
+            print("  Stopping API client...")
+            tracker.api_client.stop()
 
 
 if __name__ == "__main__":
