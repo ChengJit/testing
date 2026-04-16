@@ -568,15 +568,25 @@ class QRBoxTracker:
         display = frame.copy()
         h, w = display.shape[:2]
 
-        # Draw QR codes
-        for qr in qr_codes:
-            pts = qr['points']
-            cv2.polylines(display, [pts], True, (255, 0, 255), 2)
-            cv2.putText(display, qr['data'][:20], (pts[0][0], pts[0][1] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        # Get SKUs of currently tracked boxes (not ghosts)
+        active_skus = {tb.get('qr_data') for tb in self.tracked_boxes if tb.get('qr_data')}
 
-        # Draw boxes
+        # Draw QR codes only if linked to active box
+        for qr in qr_codes:
+            if qr['data'] in active_skus:
+                pts = qr['points']
+                cv2.polylines(display, [pts], True, (255, 0, 255), 2)
+                cv2.putText(display, qr['data'][:20], (pts[0][0], pts[0][1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
+        # Get active box IDs
+        active_box_ids = {tb['id'] for tb in self.tracked_boxes}
+
+        # Draw boxes (only active, not ghosts)
         for det in detections:
+            # Skip if box moved to ghost
+            if det.get('box_id') and det['box_id'] not in active_box_ids:
+                continue
             if det.get('sku'):
                 color = (0, 255, 0)  # Green - has QR
                 label = det['sku'][:16]
