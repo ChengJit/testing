@@ -64,7 +64,14 @@ CONFIG = {
 
     # Fisheye correction (for Tapo TC74)
     "fisheye_correct": True,
-    "fisheye_strength": 0.3,      # 0.0 = no correction, 1.0 = max correction (1.0 = no zoom)
+    "fisheye_strength": 0.3,      # 0.0 = no correction, 1.0 = max correction
+
+    # QR Detection version (for 3K cameras)
+    # "legacy" = scan full frame (slow)
+    # "v1" = crop-based (fast)
+    # "v2" = multi-threaded (faster)
+    # "v3" = optimized for 3K (fastest + best accuracy)
+    "qr_detector": "v3", (1.0 = no zoom)
 
     # API Config
     "api_enabled": True,
@@ -173,6 +180,40 @@ class QRBoxTracker:
         self.config = config
         self.model = None
         self.qr_detector = cv2.QRCodeDetector()
+
+        # Initialize QR detector based on config
+        self.qr_detector_version = config.get("qr_detector", "legacy")
+        self.fast_qr_detector = None
+
+        if self.qr_detector_version == "v1":
+            try:
+                from qr_detector_v1_crop import QRDetectorV1
+                self.fast_qr_detector = QRDetectorV1(padding=30, min_crop_size=150)
+                print(f"  QR Detector: V1 (crop-based)")
+            except ImportError as e:
+                print(f"  QR Detector V1 failed: {e}, using legacy")
+                self.qr_detector_version = "legacy"
+
+        elif self.qr_detector_version == "v2":
+            try:
+                from qr_detector_v2_threaded import QRDetectorV2
+                self.fast_qr_detector = QRDetectorV2(padding=30, min_crop_size=150, max_workers=4)
+                print(f"  QR Detector: V2 (multi-threaded)")
+            except ImportError as e:
+                print(f"  QR Detector V2 failed: {e}, using legacy")
+                self.qr_detector_version = "legacy"
+
+        elif self.qr_detector_version == "v3":
+            try:
+                from qr_detector_v3_fast import QRDetectorV3
+                self.fast_qr_detector = QRDetectorV3(padding=40, target_crop_size=400, max_workers=4, enhance=True)
+                print(f"  QR Detector: V3 (optimized for 3K)")
+            except ImportError as e:
+                print(f"  QR Detector V3 failed: {e}, using legacy")
+                self.qr_detector_version = "legacy"
+
+        if self.qr_detector_version == "legacy":
+            print(f"  QR Detector: Legacy (full frame scan)")
 
         # Initialize API client
         self.api_client = None
@@ -790,14 +831,23 @@ def run(camera_ip):
 
                 start = time.time()
 
-                # Detect QR codes
-                qr_codes = tracker.detect_qr_codes(frame)
-
-                # Detect boxes
+                # Detect boxes first (YOLO)
                 box_dets = tracker.detect_boxes(frame)
 
-                # Link QR to boxes
-                box_dets = tracker.link_qr_to_boxes(box_dets, qr_codes)
+                # Detect QR codes (use fast detector if available)
+                if tracker.fast_qr_detector and box_dets:
+                    # Fast: scan QR only in box regions
+                    qr_codes = tracker.fast_qr_detector.detect_in_frame(frame, box_dets)
+                    # Link QR to boxes (already linked by detector)
+                    for qr in qr_codes:
+                        if 'box_detection' in qr:
+                            qr['box_detection']['qr_data'] = qr['data']
+                            qr['box_detection']['qr_points'] = qr['points']
+                else:
+                    # Legacy: scan full frame
+                    qr_codes = tracker.detect_qr_codes(frame)
+                    # Link QR to boxes
+                    box_dets = tracker.link_qr_to_boxes(box_dets, qr_codes)
 
                 # Track
                 detections = tracker.track_boxes(box_dets)
@@ -859,6 +909,10 @@ def run(camera_ip):
             print("  Stopping API client...")
             tracker.api_client.stop()
 
+        # Stop QR detector threads
+        if tracker.fast_qr_detector and hasattr(tracker.fast_qr_detector, 'shutdown'):
+            tracker.fast_qr_detector.shutdown()
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -899,5 +953,16 @@ if __name__ == "__main__":
 
         if "--no-fisheye" in sys.argv:
             CONFIG["fisheye_correct"] = False
+
+        if "--qr-detector" in sys.argv:
+            try:
+                idx = sys.argv.index("--qr-detector")
+                version = sys.argv[idx + 1]
+                if version in ["legacy", "v1", "v2", "v3"]:
+                    CONFIG["qr_detector"] = version
+                else:
+                    print(f"Warning: Invalid QR detector version '{version}', using v3")
+            except (IndexError, ValueError):
+                pass
 
         run(sys.argv[1])
