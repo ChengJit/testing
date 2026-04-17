@@ -38,7 +38,7 @@ CONFIG = {
 
     # YOLOv8 Detection
     "model_path": "/home/jetson/inventory_security/runs/detect/train6/weights/best.pt",
-    "confidence": 0.15,
+    "confidence": 0.6,
     "detect_interval": 0.3,
     "input_size": 480,
 
@@ -64,8 +64,7 @@ CONFIG = {
 
     # Fisheye correction (for Tapo TC74)
     "fisheye_correct": True,
-    "fisheye_strength": 0.5,      # 0.0 = no correction, 1.0 = max correction
-    "fisheye_zoom": 1.0,          # zoom after correction (1.0 = no zoom)
+    "fisheye_strength": 0.3,      # 0.0 = no correction, 1.0 = max correction (1.0 = no zoom)
 
     # API Config
     "api_enabled": True,
@@ -79,9 +78,8 @@ CONFIG = {
 class FisheyeCorrector:
     """Corrects fisheye/barrel distortion from wide-angle cameras."""
 
-    def __init__(self, strength=0.5, zoom=1.0):
+    def __init__(self, strength=0.3):
         self.strength = strength
-        self.zoom = zoom
         self._map_x = None
         self._map_y = None
         self._last_shape = None
@@ -104,16 +102,12 @@ class FisheyeCorrector:
         r = np.sqrt(x_norm**2 + y_norm**2)
 
         # Barrel distortion correction formula
-        # r_corrected = r * (1 + k * r^2) where k is negative for barrel distortion
-        k = -self.strength * 0.4  # Scale strength to reasonable range
+        k = -self.strength * 0.4
         r_corrected = r * (1 + k * r**2)
 
         # Avoid division by zero
         r_safe = np.where(r == 0, 1, r)
         scale = np.where(r == 0, 1, r_corrected / r_safe)
-
-        # Apply zoom
-        scale = scale / self.zoom
 
         # Map back to pixel coordinates
         self._map_x = (x_norm * scale * cx + cx).astype(np.float32)
@@ -754,8 +748,7 @@ def run(camera_ip):
     fisheye_corrector = None
     if CONFIG.get("fisheye_correct", False):
         fisheye_corrector = FisheyeCorrector(
-            strength=CONFIG.get("fisheye_strength", 0.5),
-            zoom=CONFIG.get("fisheye_zoom", 1.0)
+            strength=CONFIG.get("fisheye_strength", 0.3)
         )
         print(f"  Fisheye correction enabled (strength={CONFIG['fisheye_strength']})")
 
