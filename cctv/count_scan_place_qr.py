@@ -62,6 +62,11 @@ CONFIG = {
     # Logging
     "log_file": "qr_tracking_log.csv",
 
+    # Fisheye correction (for Tapo TC74)
+    "fisheye_correct": True,
+    "fisheye_strength": 0.5,      # 0.0 = no correction, 1.0 = max correction
+    "fisheye_zoom": 1.0,          # zoom after correction (1.0 = no zoom)
+
     # API Config
     "api_enabled": True,
     "api_url": "https://ops-portal.fasspay.com/report/inventory",
@@ -69,6 +74,68 @@ CONFIG = {
     "api_verify_ssl": True,
 }
 # =======================================
+
+
+class FisheyeCorrector:
+    """Corrects fisheye/barrel distortion from wide-angle cameras."""
+
+    def __init__(self, strength=0.5, zoom=1.0):
+        self.strength = strength
+        self.zoom = zoom
+        self._map_x = None
+        self._map_y = None
+        self._last_shape = None
+
+    def _build_maps(self, h, w):
+        """Build distortion correction maps."""
+        # Camera center
+        cx, cy = w / 2, h / 2
+
+        # Create coordinate grids
+        x = np.arange(w)
+        y = np.arange(h)
+        x, y = np.meshgrid(x, y)
+
+        # Normalize coordinates to [-1, 1]
+        x_norm = (x - cx) / cx
+        y_norm = (y - cy) / cy
+
+        # Distance from center
+        r = np.sqrt(x_norm**2 + y_norm**2)
+
+        # Barrel distortion correction formula
+        # r_corrected = r * (1 + k * r^2) where k is negative for barrel distortion
+        k = -self.strength * 0.4  # Scale strength to reasonable range
+        r_corrected = r * (1 + k * r**2)
+
+        # Avoid division by zero
+        r_safe = np.where(r == 0, 1, r)
+        scale = np.where(r == 0, 1, r_corrected / r_safe)
+
+        # Apply zoom
+        scale = scale / self.zoom
+
+        # Map back to pixel coordinates
+        self._map_x = (x_norm * scale * cx + cx).astype(np.float32)
+        self._map_y = (y_norm * scale * cy + cy).astype(np.float32)
+        self._last_shape = (h, w)
+
+    def correct(self, frame):
+        """Apply fisheye correction to frame."""
+        if frame is None:
+            return None
+
+        h, w = frame.shape[:2]
+
+        # Rebuild maps if frame size changed
+        if self._last_shape != (h, w):
+            self._build_maps(h, w)
+
+        # Apply remapping
+        corrected = cv2.remap(frame, self._map_x, self._map_y,
+                              interpolation=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT)
+        return corrected
 
 
 class FrameGrabber:
@@ -622,7 +689,7 @@ class QRBoxTracker:
 
         # Help
         cv2.rectangle(display, (0, h - 30), (w, h), (30, 30, 30), -1)
-        cv2.putText(display, "Q:Quit | I:Inventory | +/-:Threshold | R:ROI",
+        cv2.putText(display, "Q:Quit | I:Inventory | +/-:Threshold | F/G:Fisheye",
                    (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         return display
@@ -683,6 +750,15 @@ def run(camera_ip):
 
     print(f"Connected! {frame.shape[1]}x{frame.shape[0]}")
 
+    # Initialize fisheye corrector
+    fisheye_corrector = None
+    if CONFIG.get("fisheye_correct", False):
+        fisheye_corrector = FisheyeCorrector(
+            strength=CONFIG.get("fisheye_strength", 0.5),
+            zoom=CONFIG.get("fisheye_zoom", 1.0)
+        )
+        print(f"  Fisheye correction enabled (strength={CONFIG['fisheye_strength']})")
+
     headless = CONFIG["headless"]
     if not headless:
         try:
@@ -710,6 +786,10 @@ def run(camera_ip):
             if not ret:
                 time.sleep(0.01)
                 continue
+
+            # Apply fisheye correction
+            if fisheye_corrector:
+                frame = fisheye_corrector.correct(frame)
 
             # Run detection
             if time.time() - last_detect >= detect_interval:
@@ -760,6 +840,16 @@ def run(camera_ip):
                 elif key in (ord('-'), ord('_')):
                     tracker.confidence = max(0.05, tracker.confidence - 0.05)
                     print(f"  Threshold: {tracker.confidence:.2f}")
+                elif key == ord('f') and fisheye_corrector:
+                    # Increase fisheye correction
+                    fisheye_corrector.strength = min(1.0, fisheye_corrector.strength + 0.1)
+                    fisheye_corrector._last_shape = None  # Force rebuild maps
+                    print(f"  Fisheye strength: {fisheye_corrector.strength:.1f}")
+                elif key == ord('g') and fisheye_corrector:
+                    # Decrease fisheye correction
+                    fisheye_corrector.strength = max(0.0, fisheye_corrector.strength - 0.1)
+                    fisheye_corrector._last_shape = None  # Force rebuild maps
+                    print(f"  Fisheye strength: {fisheye_corrector.strength:.1f}")
             else:
                 time.sleep(0.01)
 
@@ -787,6 +877,7 @@ if __name__ == "__main__":
         print("  python count_scan_place_qr.py 192.168.122.128")
         print("  python count_scan_place_qr.py 192.168.122.128 --headless")
         print("  python count_scan_place_qr.py 192.168.122.128 --threshold 0.25")
+        print("  python count_scan_place_qr.py 192.168.122.128 --fisheye 0.6")
         print("\nThis script:")
         print("  - Detects boxes using YOLOv8")
         print("  - Reads QR codes on boxes automatically")
@@ -803,5 +894,17 @@ if __name__ == "__main__":
                 CONFIG["confidence"] = float(sys.argv[idx + 1])
             except (IndexError, ValueError):
                 print("Warning: Invalid threshold, using default")
+
+        if "--fisheye" in sys.argv:
+            try:
+                idx = sys.argv.index("--fisheye")
+                CONFIG["fisheye_correct"] = True
+                CONFIG["fisheye_strength"] = float(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                print("Warning: Invalid fisheye value, using default 0.5")
+                CONFIG["fisheye_strength"] = 0.5
+
+        if "--no-fisheye" in sys.argv:
+            CONFIG["fisheye_correct"] = False
 
         run(sys.argv[1])
