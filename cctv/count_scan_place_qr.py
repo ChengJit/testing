@@ -71,7 +71,7 @@ CONFIG = {
     # "v1" = crop-based (fast)
     # "v2" = multi-threaded (faster)
     # "v3" = optimized for 3K (fastest + best accuracy)
-    "qr_detector": "v3", (1.0 = no zoom)
+    "qr_detector": "v3",
 
     # API Config
     "api_enabled": True,
